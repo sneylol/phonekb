@@ -260,7 +260,7 @@
     <button data-combo="8,7">Desk</button>
   </div>
   <div style="padding: 8px 8px 0">
-    <textarea id="bulk" placeholder="Paste a block of text here, then tap Send text (ASCII only)"></textarea>
+    <textarea id="bulk" placeholder="Paste a block of text here, then tap Send text"></textarea>
     <div class="row r2" style="padding: 6px 0 0">
       <button id="sendBulk">Send text</button>
       <button id="stopBulk">Stop</button>
@@ -466,9 +466,15 @@ for (let i = 1; i <= 12; i++) {
 }
 $("moreBtn").onclick = () => $("more").classList.toggle("open");
 
-// Character -> HID usage (US layout), used only when a modifier is armed
+// The PC uses a German (DE/AT) layout: there Y and Z swap places, so a
+// shortcut like Ctrl+Z must press the key that is "Y" on a US keyboard.
+const GERMAN_PC = true;
+
+// Character -> HID usage, used only when a modifier is armed (and for macros)
 function charToKey(ch) {
   const c = ch.toLowerCase();
+  if (GERMAN_PC && c === "z") return 0x1C;
+  if (GERMAN_PC && c === "y") return 0x1D;
   if (c >= "a" && c <= "z") return 0x04 + c.charCodeAt(0) - 97;
   if (c >= "1" && c <= "9") return 0x1E + c.charCodeAt(0) - 49;
   const map = { "0": 0x27, " ": 0x2C, "-": 0x2D, "=": 0x2E, "[": 0x2F, "]": 0x30, "\\": 0x31,
@@ -476,11 +482,12 @@ function charToKey(ch) {
   return map[c] || 0;
 }
 
-// Normalise phone-keyboard characters to plain ASCII
+// Normalise phone-keyboard characters to what the Flipper can type:
+// ASCII plus the German keys (umlauts, ß, §, °, ´, ², ³, €, µ).
 function toAscii(s) {
-  return s.replace(/[‘’‚′]/g, "'").replace(/[“”„″]/g, '"')
+  return s.normalize("NFC").replace(/[‘’‚′]/g, "'").replace(/[“”„″]/g, '"')
     .replace(/[–—−]/g, "-").replace(/…/g, "...").replace(/ /g, " ")
-    .replace(/[^\x09\x0A\x20-\x7E]/g, "");
+    .replace(/[^\x09\x0A\x20-\x7EäöüÄÖÜß§°´²³€µ]/g, "");
 }
 
 function typeText(s) {
@@ -490,7 +497,8 @@ function typeText(s) {
     for (const ch of s) { const k = charToKey(ch); if (k) tap(k); }
     return;
   }
-  const bytes = [...s].map((c) => c.charCodeAt(0));
+  // Sent as UTF-8; the Flipper app decodes it (also across packet borders)
+  const bytes = Array.from(new TextEncoder().encode(s));
   for (let i = 0; i < bytes.length; i += 200) {
     const part = bytes.slice(i, i + 200);
     send(OP.TEXT, part.length, ...part);
@@ -662,7 +670,9 @@ function keyToName(m, k) {
   const parts = [];
   if (m & 1) parts.push("CTRL"); if (m & 4) parts.push("ALT"); if (m & 2) parts.push("SHIFT"); if (m & 8) parts.push("GUI");
   let n = KEY_OUT[k];
-  if (!n && k >= 0x04 && k <= 0x1D) n = String.fromCharCode(97 + k - 0x04);
+  if (!n && GERMAN_PC && k === 0x1C) n = "z";
+  else if (!n && GERMAN_PC && k === 0x1D) n = "y";
+  else if (!n && k >= 0x04 && k <= 0x1D) n = String.fromCharCode(97 + k - 0x04);
   else if (!n && k >= 0x1E && k <= 0x26) n = String(k - 0x1D);
   else if (!n && k === 0x27) n = "0";
   else if (!n && k >= 0x3A && k <= 0x45) n = "F" + (k - 0x39);
@@ -725,7 +735,7 @@ function recordBytes(b) {
     case OP.DOWN: rec({ t: "press", b: b[1] }); break;
     case OP.UP: rec({ t: "release", b: b[1] }); break;
     case OP.CONSUMER: rec({ t: "media", c: b[1] | (b[2] << 8) }); break;
-    case OP.TEXT: rec({ t: "text", s: String.fromCharCode(...b.slice(2, 2 + b[1])) }); break;
+    case OP.TEXT: rec({ t: "text", s: new TextDecoder().decode(new Uint8Array(b.slice(2, 2 + b[1]))) }); break;
   }
 }
 function startRec() {
