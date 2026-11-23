@@ -290,7 +290,7 @@ const RX_CHAR = "19ed82ae-ed21-4c9d-4145-228e62fe0000"; // phone -> Flipper
 // No-PIN Flipper app: the page proves itself with a saved random secret instead of Bluetooth pairing
 const AUTH_CHAR = "19ed82ae-ed21-4c9d-4145-228e65fe0000";   // write 16-byte secret
 const STATUS_CHAR = "19ed82ae-ed21-4c9d-4145-228e66fe0000"; // read: 0 waiting, 1 ok, 2 rejected
-const CONFIG_CHAR = "19ed82ae-ed21-4c9d-4145-228e67fe0000"; // write: [0..1] = ms pause after each typed letter, [2] bit 0 = stop typing
+const CONFIG_CHAR = "19ed82ae-ed21-4c9d-4145-228e67fe0000"; // write: [0..1] ms pause per letter, [2] bit0 stop / bit1 paused, [3] layout (0 US, 1 DE)
 
 // Random secret for this browser, created once and kept in localStorage.
 // The Flipper remembers the first secret it receives (hold Left on the Flipper to reset).
@@ -470,7 +470,8 @@ async function pump() {
       if ((delayDirty || stopPending) && cfgChar) {   // settings go through the same one-at-a-time queue
         const d = typeDelay(), flags = (stopPending ? 1 : 0) | (paused ? 2 : 0);
         delayDirty = false; stopPending = false;
-        await cfgChar.writeValueWithResponse(new Uint8Array([d & 0xFF, d >> 8, flags]));
+        // [3] = PC layout, so the Flipper presses the right keys for y/z, umlauts, symbols
+        await cfgChar.writeValueWithResponse(new Uint8Array([d & 0xFF, d >> 8, flags, GERMAN_PC ? 1 : 0]));
       }
       flushMotion();
       if (!queue.length) break;

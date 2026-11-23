@@ -23,6 +23,7 @@ extern "C" {
  *                                                                letter (little-endian; 1 byte also ok),
  *                                                                [2] bit 0 = stop typing what's queued
  *                                                                [2] bit 1 = paused (hold everything queued)
+ *                                                                [3] = PC keyboard layout (PhoneKbLayout)
  */
 extern const FuriHalBleProfileTemplate* const ble_profile_phone_kb;
 
@@ -65,6 +66,14 @@ bool ble_profile_phone_kb_is_connected(FuriHalBleProfileBase* profile);
 
 /** Pause after each letter of typed text, as last set by the phone (CONFIG). */
 uint16_t ble_profile_phone_kb_get_letter_delay(FuriHalBleProfileBase* profile);
+
+typedef enum {
+    PhoneKbLayoutUs = 0,
+    PhoneKbLayoutDe = 1,
+} PhoneKbLayout;
+
+/** Keyboard layout the PC uses, as last set by the phone (CONFIG [3]). Default US. */
+PhoneKbLayout ble_profile_phone_kb_get_layout(FuriHalBleProfileBase* profile);
 
 /** True while the phone has paused typing (CONFIG [2] bit 1). Cleared on disconnect. */
 bool ble_profile_phone_kb_is_paused(FuriHalBleProfileBase* profile);

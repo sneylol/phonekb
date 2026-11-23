@@ -107,6 +107,7 @@ typedef struct {
     volatile uint16_t letter_delay_ms;
     volatile uint32_t stop_count;
     volatile bool paused;
+    volatile uint8_t layout;
     volatile bool link_up;
     PhoneKbRxCallback rx_callback;
     PhoneKbAuthCallback auth_callback;
@@ -177,6 +178,7 @@ static BleEventAckStatus phone_kb_event_handler(void* event, void* context) {
                 if(mod->Attr_Data[2] & 1) p->stop_count++;
                 p->paused = (mod->Attr_Data[2] & 2) != 0;
             }
+            if(mod->Attr_Data_Length >= 4) p->layout = mod->Attr_Data[3];
         }
         return BleEventAckFlowEnable;
     }
@@ -320,4 +322,9 @@ bool ble_profile_phone_kb_is_connected(FuriHalBleProfileBase* profile) {
 bool ble_profile_phone_kb_is_paused(FuriHalBleProfileBase* profile) {
     furi_check(profile && (profile->config == ble_profile_phone_kb));
     return ((BleProfilePhoneKb*)profile)->paused;
+}
+
+PhoneKbLayout ble_profile_phone_kb_get_layout(FuriHalBleProfileBase* profile) {
+    furi_check(profile && (profile->config == ble_profile_phone_kb));
+    return (PhoneKbLayout)((BleProfilePhoneKb*)profile)->layout;
 }

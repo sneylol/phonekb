@@ -83,12 +83,12 @@ On the Flipper: **Back** exits, **hold Left** forgets the linked phone (the next
 | "Wrong key" | The Flipper is linked to another phone or browser (or this browser's data was cleared). Hold Left on the Flipper, then tap Connect. |
 | Pairing fails (PIN builds) | Hold Left on the Flipper to forget old pairings, remove "PhoneKB" from Android's Bluetooth settings, and try again. |
 | Flipper crashes with "HardFault" | Wrong `.fap` for your firmware version; see the table above. |
-| Wrong symbols typed | The PC must use the US keyboard layout. Accented letters and emoji are skipped. |
+| Wrong symbols typed (Y/Z swapped, missing umlauts) | The PC's keyboard layout must match the page: `GERMAN_PC` in `index.html` (`true` = German, `false` = US). The mntm-012 build types German layout including ä ö ü ß € @; other builds are US only. Emoji are skipped. |
 
 ## Limitations
 
 - Android + Chrome only.
-- US keyboard layout only.
+- US or German PC keyboard layout (German needs the mntm-012 build).
 - While the app is running, qFlipper and the Flipper phone app can't connect to the Flipper.
 
 ## Building from source

@@ -18,7 +18,8 @@
  *   0x05 delta           vertical scroll (int8)
  *   0x06                 release everything
  *   0x07 lo hi           consumer key tap (volume, play/pause, ...)
- *   0x08 len bytes...    type ASCII text (US layout, len <= 255)
+ *   0x08 len bytes...    type UTF-8 text (len <= 255; characters may span packets),
+ *                        on the PC layout the phone set (US or German)
  *   0x09 mods key        key down (hold)
  *   0x0A mods key        key up
  */
@@ -35,6 +36,7 @@
 #include <storage/storage.h>
 
 #include "phone_kb_profile.h"
+#include "layout_de.h"
 
 #define TAG              "PhoneKB"
 #define KEYS_PATH        APP_DATA_PATH(".phone_kb.keys")
@@ -87,6 +89,8 @@ typedef struct {
     // parser state
     uint8_t pkt[260];
     uint16_t pkt_len;
+    uint32_t utf8_cp; // UTF-8 character being decoded (may span packets)
+    uint8_t utf8_left; // continuation bytes still expected
 } PhoneKb;
 
 // ---------------------------------------------------------------- BLE side
@@ -239,39 +243,88 @@ static bool wait_while_paused(PhoneKb* app) {
     return true;
 }
 
-// Returns false if typing should stop.
-static bool type_char(PhoneKb* app, uint8_t c) {
-    if(typing_should_stop(app)) return false;
-    if(!wait_while_paused(app)) return false;
-    uint16_t key;
-    if(c == '\n' || c == '\r') {
-        key = HID_KEYBOARD_RETURN;
-    } else if(c == '\t') {
-        key = HID_KEYBOARD_TAB;
-    } else if(c == '\b') {
-        key = HID_KEYBOARD_DELETE; // HID "Delete" == Backspace
-    } else {
-        key = HID_ASCII_TO_KEY(c);
+// Feed one byte of UTF-8 text. Returns true when *cp holds a complete character.
+static bool utf8_feed(PhoneKb* app, uint8_t b, uint32_t* cp) {
+    if(b < 0x80) {
+        app->utf8_left = 0;
+        *cp = b;
+        return true;
     }
-    if(key == HID_KEYBOARD_NONE) return true;
-    furi_hal_hid_kb_press(key);
-    furi_hal_hid_kb_release(key);
-    app->keys_sent++;
-    // Pause between letters; set from the phone's "Letter delay" slider
-    return letter_pause(app);
+    if((b & 0xC0) == 0x80) { // continuation byte
+        if(!app->utf8_left) return false; // stray: skip
+        app->utf8_cp = (app->utf8_cp << 6) | (b & 0x3F);
+        if(--app->utf8_left) return false;
+        *cp = app->utf8_cp;
+        return true;
+    }
+    if((b & 0xE0) == 0xC0) {
+        app->utf8_cp = b & 0x1F;
+        app->utf8_left = 1;
+    } else if((b & 0xF0) == 0xE0) {
+        app->utf8_cp = b & 0x0F;
+        app->utf8_left = 2;
+    } else if((b & 0xF8) == 0xF0) {
+        app->utf8_cp = b & 0x07;
+        app->utf8_left = 3;
+    } else {
+        app->utf8_left = 0;
+    }
+    return false;
 }
 
-static void remember_text(PhoneKb* app, const uint8_t* s, uint8_t len) {
+// Last typed text for the Flipper screen (its font is ASCII only)
+static void remember_char(PhoneKb* app, uint32_t cp) {
+    char c;
+    if(cp >= 32 && cp < 127) c = (char)cp;
+    else if(cp == 0xE4 || cp == 0xC4) c = cp == 0xE4 ? 'a' : 'A'; // ä Ä
+    else if(cp == 0xF6 || cp == 0xD6) c = cp == 0xF6 ? 'o' : 'O'; // ö Ö
+    else if(cp == 0xFC || cp == 0xDC) c = cp == 0xFC ? 'u' : 'U'; // ü Ü
+    else if(cp == 0xDF) c = 's'; // ß
+    else if(cp == '\n' || cp == '\t') c = ' ';
+    else c = '?';
     size_t cur = strlen(app->last_text);
-    for(uint8_t i = 0; i < len; i++) {
-        char c = (s[i] >= 32 && s[i] < 127) ? (char)s[i] : ' ';
-        if(cur >= sizeof(app->last_text) - 1) {
-            memmove(app->last_text, app->last_text + 1, cur);
-            cur--;
-        }
-        app->last_text[cur++] = c;
-        app->last_text[cur] = '\0';
+    if(cur >= sizeof(app->last_text) - 1) {
+        memmove(app->last_text, app->last_text + 1, cur);
+        cur--;
     }
+    app->last_text[cur++] = c;
+    app->last_text[cur] = '\0';
+}
+
+// Key (usage + modifiers) for a character on a US-layout PC, or NONE
+static uint16_t us_key(uint32_t cp) {
+    if(cp >= 128) return HID_KEYBOARD_NONE;
+    if(cp == '\n' || cp == '\r') return HID_KEYBOARD_RETURN;
+    if(cp == '\t') return HID_KEYBOARD_TAB;
+    if(cp == '\b') return HID_KEYBOARD_DELETE; // HID "Delete" == Backspace
+    return HID_ASCII_TO_KEY(cp);
+}
+
+// Type one character on the PC's layout. Returns false if typing should stop.
+static bool type_codepoint(PhoneKb* app, uint32_t cp) {
+    if(typing_should_stop(app)) return false;
+    if(!wait_while_paused(app)) return false;
+
+    uint16_t key = HID_KEYBOARD_NONE;
+    bool dead = false;
+    if(ble_profile_phone_kb_get_layout(app->profile) == PhoneKbLayoutDe) {
+        if(!layout_de_lookup(cp, &key, &dead)) key = HID_KEYBOARD_NONE;
+    } else {
+        key = us_key(cp);
+    }
+    if(key == HID_KEYBOARD_NONE) return true; // can't be typed on this layout: skip it
+
+    furi_hal_hid_kb_press(key);
+    furi_hal_hid_kb_release(key);
+    if(dead) {
+        // Dead key (^ ´ `): Space makes it type the accent itself
+        furi_hal_hid_kb_press(HID_KEYBOARD_SPACEBAR);
+        furi_hal_hid_kb_release(HID_KEYBOARD_SPACEBAR);
+    }
+    app->keys_sent++;
+    remember_char(app, cp);
+    // Pause between letters; set from the phone's "Letter delay" slider
+    return letter_pause(app);
 }
 
 static uint16_t packet_length(const uint8_t* p, uint16_t have) {
@@ -336,14 +389,14 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
         break;
     }
     case OpText: {
-        uint8_t typed = 0;
-        while(typed < p[1]) {
-            if(!type_char(app, p[2 + typed++])) {
+        for(uint8_t i = 0; i < p[1]; i++) {
+            uint32_t cp;
+            if(!utf8_feed(app, p[2 + i], &cp)) continue;
+            if(!type_codepoint(app, cp)) {
                 app->typing_aborted = true;
                 break;
             }
         }
-        remember_text(app, &p[2], typed);
         view_port_update(app->view_port);
         break;
     }
@@ -355,6 +408,7 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
 // Throw away everything still queued from the phone (after Stop, a disconnect or Back)
 static void clear_queue(PhoneKb* app) {
     app->pkt_len = 0;
+    app->utf8_left = 0;
     uint8_t junk[64];
     while(furi_stream_buffer_receive(app->rx, junk, sizeof(junk), 0) > 0) {
     }
