@@ -81,6 +81,7 @@ typedef struct {
     volatile bool token_save_pending;
     volatile bool rejected; // last phone sent the wrong secret
     volatile uint32_t rx_dropped; // bytes lost because the buffer was full
+    uint32_t bytes_done; // RX bytes typed or cleared (+ rx_dropped = PROGRESS for the phone)
 
     // Typing can take minutes with a long letter delay, so it must be stoppable
     uint32_t stop_seen; // last stop request handled (see ble_profile_phone_kb_get_stop_count)
@@ -244,15 +245,18 @@ static bool typing_should_stop(PhoneKb* app) {
 }
 
 // Pause after a letter in 10 ms steps. Returns false if typing should stop.
+// The delay is re-read every step, so a speed change on the phone (also while
+// paused) applies right away instead of after a long pause ends.
 static bool letter_pause(PhoneKb* app) {
-    uint32_t left = ble_profile_phone_kb_get_letter_delay(app->profile);
-    while(left > 0) {
-        uint32_t step = left < 10 ? left : 10;
+    uint32_t waited = 0;
+    for(;;) {
+        uint32_t delay = ble_profile_phone_kb_get_letter_delay(app->profile);
+        if(waited >= delay) return true;
+        uint32_t step = delay - waited < 10 ? delay - waited : 10;
         furi_delay_ms(step);
-        left -= step;
+        waited += step;
         if(typing_should_stop(app)) return false;
     }
-    return true;
 }
 
 static void release_everything(PhoneKb* app) {
@@ -451,6 +455,7 @@ static void clear_queue(PhoneKb* app, bool was_typing) {
     while((got = furi_stream_buffer_receive(app->rx, junk, sizeof(junk), 0)) > 0) {
         dropped += got;
     }
+    app->bytes_done += dropped;
     release_everything(app);
     if(was_typing || dropped) {
         event_log("typing stopped, %lu queued bytes dropped", (unsigned long)dropped);
@@ -552,6 +557,7 @@ int32_t phone_kb_app(void* p) {
     bool shown_connected = false;
     bool shown_paused = false;
     uint32_t link_up_at = 0;
+    uint32_t published_progress = 0;
     uint32_t logged_dropped = 0;
     while(running) {
         // While paused, leave everything queued where it is
@@ -562,7 +568,10 @@ int32_t phone_kb_app(void* p) {
         } else {
             n = furi_stream_buffer_receive(app->rx, chunk, sizeof(chunk), 30);
         }
-        if(n > 0) process_bytes(app, chunk, n);
+        if(n > 0) {
+            process_bytes(app, chunk, n);
+            app->bytes_done += n;
+        }
 
         paused = ble_profile_phone_kb_is_paused(app->profile);
         if(paused != shown_paused) {
@@ -578,6 +587,13 @@ int32_t phone_kb_app(void* p) {
             clear_queue(app, false);
         }
         check_release_request(app);
+
+        // Tell the phone how far we are, so it sends more exactly when there's room
+        uint32_t progress = app->bytes_done + app->rx_dropped;
+        if(progress != published_progress) {
+            published_progress = progress;
+            ble_profile_phone_kb_publish_progress(app->profile, progress);
+        }
 
         if(app->token_save_pending) {
             app->token_save_pending = false;

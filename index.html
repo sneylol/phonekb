@@ -290,6 +290,7 @@ const RX_CHAR = "19ed82ae-ed21-4c9d-4145-228e62fe0000"; // phone -> Flipper
 // No-PIN Flipper app: the page proves itself with a saved random secret instead of Bluetooth pairing
 const AUTH_CHAR = "19ed82ae-ed21-4c9d-4145-228e65fe0000";   // write 16-byte secret
 const STATUS_CHAR = "19ed82ae-ed21-4c9d-4145-228e66fe0000"; // read: 0 waiting, 1 ok, 2 rejected
+const PROGRESS_CHAR = "19ed82ae-ed21-4c9d-4145-228e68fe0000"; // read/notify: uint32 LE bytes the Flipper is done with
 const CONFIG_CHAR = "19ed82ae-ed21-4c9d-4145-228e67fe0000"; // write: [0..1] ms pause per letter, [2] bit0 stop / bit1 paused, [3] layout (0 US, 1 DE)
 
 // Random secret for this browser, created once and kept in localStorage.
@@ -311,6 +312,7 @@ const KEY = { ENTER: 0x28, BKSP: 0x2A, TAB: 0x2B, SPACE: 0x2C };
 
 const $ = (id) => document.getElementById(id);
 let device = null, rxChar = null, cfgChar = null, connected = false, wantConnected = false;
+let progressChar = null;    // newer Flipper app: tells us how much it has typed (flow control)
 
 function setStatus(text, ok) {
   $("status").textContent = text;
@@ -403,6 +405,7 @@ async function openGattOnce() {
     // Letter delay setting (older Flipper builds don't have it: then typing speed is fixed)
     try { cfgChar = await svc.getCharacteristic(CONFIG_CHAR); } catch (_) { cfgChar = null; }
     delayDirty = true; stopPending = false;   // a Stop tapped while offline must not hit the next text
+    await setupProgress(svc);
   } else {
     // First write needs an encrypted, bonded link. Android shows its pairing
     // dialog here: type the 6-digit PIN that appears on the Flipper's screen.
@@ -413,7 +416,9 @@ async function openGattOnce() {
   for (let attempt = 0; attempt < 8; attempt++) {
     try {
       await rxChar.writeValueWithResponse(new Uint8Array([OP.RELEASE]));
+      if (progressChar) sentBytes += 1;   // the Flipper counts this byte too
       connected = true;
+      keepAwake(true);
       break;
     } catch (e) {
       if (!device.gatt.connected) throw new Error("Link dropped while pairing (" + e.message + ")");   // retried by openGatt
@@ -427,8 +432,9 @@ async function openGattOnce() {
 }
 
 function onDisconnected() {
-  connected = false; rxChar = null; cfgChar = null;
-  queue = []; backlogMs = 0;   // the Flipper drops its queue on disconnect, so don't resend stale input
+  connected = false; rxChar = null; cfgChar = null; progressChar = null;
+  queue = []; backlogMs = 0; textLog = [];   // the Flipper drops its queue on disconnect, so don't resend stale input
+  keepAwake(false);
   setPaused(false, false);   // the Flipper drops its queue on disconnect
   leftLocked = false; $("lock").classList.remove("on"); $("lock").textContent = "Hold click"; // Flipper releases buttons on disconnect
   setStatus("Disconnected", false);
@@ -485,7 +491,7 @@ function send(...bytes) {
 }
 
 function flushMotion() {
-  if (backlog() > 50) {     // the Flipper is busy typing: a late pointer jump is worse than none
+  if (flipperBusyMs() > 50) {   // the Flipper is busy typing: a late pointer jump is worse than none
     moveX = moveY = scrollAcc = 0;
     return;
   }
@@ -501,39 +507,150 @@ function flushMotion() {
   if (s !== 0) { const c = Math.max(-127, Math.min(127, s)); queue.push([OP.SCROLL, c & 0xFF]); rec({ t: "scroll", n: c }); scrollAcc -= c; }
 }
 
+// ---- flow control ----
+// The newer Flipper app reports (PROGRESS) how many of the bytes we sent it has
+// finished. We keep at most FLOW_MAX bytes "in flight", so its 2 KB buffer can't
+// overflow, and we send more the moment it has room, so it never runs dry.
+// (Older builds: fall back to the time estimate above.)
+const FLOW_MAX = 1024;
+let sentBytes = 0, flipperDone = 0, progBase = 0, progressAt = 0, progressNotify = false;
+let textLog = [];           // text packets in flight: {end: sentBytes after it, letters}
+const progressListening = new WeakSet();
+
+function setProgress(raw) {
+  flipperDone = Math.min(sentBytes, (raw - progBase) >>> 0);
+  progressAt = performance.now();
+  while (textLog.length && textLog[0].end <= flipperDone) textLog.shift();
+  if (queue.length && !pumping) pump();
+}
+function inFlight() { return progressChar ? Math.max(0, sentBytes - flipperDone) : 0; }
+function lettersInFlight() { let n = 0; for (const t of textLog) if (t.end > flipperDone) n += t.letters; return n; }
+// How long the Flipper still needs for the text it has (ms)
+function flipperBusyMs() { return progressChar ? lettersInFlight() * msPerLetter() : backlog(); }
+
+async function setupProgress(svc) {
+  progressChar = null; progressNotify = false; textLog = []; sentBytes = 0; flipperDone = 0;
+  let ch;
+  try { ch = await svc.getCharacteristic(PROGRESS_CHAR); } catch (_) { return; }   // older Flipper app
+  progBase = (await ch.readValue()).getUint32(0, true);
+  progressAt = performance.now();
+  try {
+    if (!progressListening.has(ch)) {
+      ch.addEventListener("characteristicvaluechanged", (e) => { if (ch === progressChar) setProgress(e.target.value.getUint32(0, true)); });
+      progressListening.add(ch);
+    }
+    await ch.startNotifications();
+    progressNotify = true;
+  } catch (_) { /* no notifications: we read it when we need it */ }
+  progressChar = ch;
+}
+
+// Web Bluetooth allows one GATT operation at a time: run them in order
+let gattChain = Promise.resolve();
+function gatt(fn) { const p = gattChain.then(fn); gattChain = p.catch(() => {}); return p; }
+
+async function refreshProgress() {
+  const ch = progressChar;
+  if (!ch) return;
+  try { const v = await gatt(() => ch.readValue()); if (ch === progressChar) setProgress(v.getUint32(0, true)); } catch (_) {}
+}
+
+// Wait until the Flipper has typed everything sent so far (or cancelled() / disconnect)
+async function waitFlipperDone(cancelled) {
+  while (connected && progressChar && !cancelled() && (queue.length || pumping || inFlight() > 0)) {
+    const stale = performance.now() - progressAt > (progressNotify ? 1000 : 200);
+    if (stale && !paused && !pumping && !queue.length) await refreshProgress();
+    await sleep(30);
+  }
+}
+
+let sendFails = 0, sendErrShown = false;
 async function pump() {
   if (pumping || !connected) return;
   pumping = true;
+  let retryIn = 0;
   try {
     for (;;) {
+      if (!connected) break;
       if ((delayDirty || stopPending || releasePending) && cfgChar) {   // settings use the same one-at-a-time queue
         const d = typeDelay(), flags = (stopPending ? 1 : 0) | (paused ? 2 : 0) | (releasePending ? 4 : 0);
         delayDirty = false; stopPending = false; releasePending = false;
-        // [3] = PC layout, so the Flipper presses the right keys for y/z, umlauts, symbols
-        await cfgChar.writeValueWithResponse(new Uint8Array([d & 0xFF, d >> 8, flags, GERMAN_PC ? 1 : 0]));
+        try {
+          // [3] = PC layout, so the Flipper presses the right keys for y/z, umlauts, symbols
+          await gatt(() => cfgChar.writeValueWithResponse(new Uint8Array([d & 0xFF, d >> 8, flags, GERMAN_PC ? 1 : 0])));
+        } catch (e) {
+          delayDirty = true; if (flags & 1) stopPending = true; if (flags & 4) releasePending = true;   // try again
+          throw e;
+        }
+        if (flags & 1) textLog = [];   // Stop: the Flipper throws away what it had
       }
       flushMotion();
       if (!queue.length) break;
-      if (backlog() > BACKLOG_MAX_MS) {  // let the Flipper catch up, then continue
-        if (!pumpTimer) pumpTimer = setTimeout(() => { pumpTimer = null; pump(); }, Math.min(250, backlogMs - BACKLOG_MAX_MS + 10));
+
+      if (progressChar) {
+        if (inFlight() + queue[0].length > FLOW_MAX) {
+          // Wait for the Flipper to make room. Notifications normally tell us; read it if they're late.
+          if (!paused && performance.now() - progressAt > (progressNotify ? 500 : 150)) {
+            await refreshProgress();
+            if (inFlight() + queue[0].length <= FLOW_MAX) continue;
+          }
+          retryIn = paused ? 300 : 100;
+          break;
+        }
+      } else if (backlog() > BACKLOG_MAX_MS) {   // older Flipper app: time estimate
+        retryIn = Math.min(250, backlogMs - BACKLOG_MAX_MS + 10);
         break;
       }
-      const out = [];
-      while (queue.length && out.length + queue[0].length <= MAX_WRITE) {
-        const cost = packetCost(queue[0]);
-        if (out.length && backlogMs + cost > BACKLOG_MAX_MS) break;
-        out.push(...queue.shift());
-        backlogMs += cost;
+
+      // One write = as many whole packets as fit
+      const pk = [];
+      let size = 0, cost = 0;
+      while (queue.length && size + queue[0].length <= MAX_WRITE) {
+        const p = queue[0];
+        if (progressChar ? inFlight() + size + p.length > FLOW_MAX
+                         : pk.length && backlogMs + cost + packetCost(p) > BACKLOG_MAX_MS) break;
+        pk.push(queue.shift()); size += p.length; cost += packetCost(p);
       }
-      if (!out.length) { const p = queue.shift(); out.push(...p); backlogMs += packetCost(p); }  // (oversized packet)
-      await rxChar.writeValueWithResponse(new Uint8Array(out));
+      if (!pk.length) { const p = queue.shift(); pk.push(p); size = p.length; cost = packetCost(p); }   // (oversized packet)
+      try {
+        await gatt(() => rxChar.writeValueWithResponse(new Uint8Array([].concat(...pk))));
+      } catch (e) {
+        queue.unshift(...pk);   // nothing is lost: retried below
+        throw e;
+      }
+      if (!progressChar) backlogMs += cost;
+      for (const p of pk) {
+        sentBytes += p.length;
+        if (p[0] === OP.TEXT) textLog.push({ end: sentBytes, letters: p[1] });
+      }
+      sendFails = 0;
     }
   } catch (e) {
-    showErr("Send failed: " + e.message);
+    sendFails++;
+    if (sendFails >= 3) { showErr("Sending is having trouble, retrying… (" + e.message + ")"); sendErrShown = true; }
+    retryIn = Math.min(2000, 200 * sendFails);
   } finally {
     pumping = false;
   }
+  if (retryIn && connected && !pumpTimer) pumpTimer = setTimeout(() => { pumpTimer = null; pump(); }, retryIn);
+  if (sendFails === 0 && sendErrShown) { showErr(""); sendErrShown = false; }
 }
+
+// Keep the phone screen on while connected: if it locks, the page stops
+// sending and typing on the PC stalls until the phone wakes up again.
+let wakeLock = null;
+async function keepAwake(on) {
+  try {
+    if (on && !wakeLock && navigator.wakeLock && document.visibilityState === "visible") {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => { wakeLock = null; });
+    } else if (!on && wakeLock) {
+      const w = wakeLock; wakeLock = null; await w.release();
+    }
+  } catch (_) {}
+}
+document.addEventListener("visibilitychange", () => { if (connected) keepAwake(true); });
+document.addEventListener("pointerdown", () => { if (connected && !wakeLock) keepAwake(true); }, true);
 
 // ---------------- keys / modifiers ----------------
 let mods = 0;
@@ -711,11 +828,20 @@ $("sendBulk").onclick = async () => {
     await whilePaused(() => bulkCancel);
     if (bulkCancel) break;
     typeText(text.slice(i, i + 100));
-    if (!paused) setStatus(`Typing ${Math.min(i + 100, text.length)}/${text.length}…`, connected);
-    // don't send faster than the Flipper types (its buffer is 2 KB); wake up early on Stop
-    await runningWait(100 * msPerLetter(), () => bulkCancel);
+    const sentChars = Math.min(i + 100, text.length);
+    const show = () => { if (!paused) setStatus(`Typing ${Math.max(0, sentChars - lettersInFlight())}/${text.length}…`, connected); };
+    show();
+    if (progressChar) {
+      // Hand the next part over as soon as this one has gone out; flow control
+      // keeps the Flipper supplied, and little waits on the phone so Stop/Pause act at once
+      while (!bulkCancel && connected && (queue.length || pumping)) { await sleep(30); show(); }
+    } else {
+      // older Flipper app: don't send faster than it types (its buffer is 2 KB)
+      await runningWait(100 * msPerLetter(), () => bulkCancel);
+    }
   }
-  if (connected) setStatus("Connected: " + device.name, true);
+  if (progressChar && !bulkCancel) await waitFlipperDone(() => { if (!paused) setStatus(`Typing ${text.length - lettersInFlight()}/${text.length}…`, connected); return bulkCancel; });
+  if (connected && !paused) setStatus("Connected: " + device.name, true);
 };
 $("pauseBulk").onclick = () => { if (connected) setPaused(!paused); };
 $("stopBulk").onclick = () => { bulkCancel = true; stopTyping(); send(OP.RELEASE); };
@@ -928,7 +1054,10 @@ async function runStep(s) {
         const part = t.slice(i, i + 100);
         await whilePaused(() => stopFlag);
         if (stopFlag) break;
-        typeText(part); await waitIdle(); await wait(part.length * msPerLetter() + 30);  // let the Flipper finish typing
+        typeText(part); await waitIdle();
+        // let the Flipper finish typing before the next step
+        if (progressChar) await waitFlipperDone(() => stopFlag);
+        else await wait(part.length * msPerLetter() + 30);
       }
       break;
     }
