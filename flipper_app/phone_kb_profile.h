@@ -22,6 +22,7 @@ extern "C" {
  *   CONFIG 19ed82ae-ed21-4c9d-4145-228e67fe0000  write          [0..1] = ms to wait after each typed
  *                                                                letter (little-endian; 1 byte also ok),
  *                                                                [2] bit 0 = stop typing what's queued
+ *                                                                [2] bit 1 = paused (hold everything queued)
  */
 extern const FuriHalBleProfileTemplate* const ble_profile_phone_kb;
 
@@ -64,6 +65,9 @@ bool ble_profile_phone_kb_is_connected(FuriHalBleProfileBase* profile);
 
 /** Pause after each letter of typed text, as last set by the phone (CONFIG). */
 uint16_t ble_profile_phone_kb_get_letter_delay(FuriHalBleProfileBase* profile);
+
+/** True while the phone has paused typing (CONFIG [2] bit 1). Cleared on disconnect. */
+bool ble_profile_phone_kb_is_paused(FuriHalBleProfileBase* profile);
 
 /** Increments each time the phone asks to stop typing (CONFIG [2] bit 0). */
 uint32_t ble_profile_phone_kb_get_stop_count(FuriHalBleProfileBase* profile);

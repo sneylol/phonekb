@@ -59,6 +59,8 @@
   #recbar { display: none; align-items: center; gap: 10px; padding: 6px 12px; background: #4a1414; font-size: 13px; }
   #recbar.on { display: flex; }
   #recbar.play { background: #14304a; }
+  #recbar:not(.play) #recPause { display: none; }
+  .pausebtn.on { background: var(--key-active); }
   #recbar span { flex: 1; }
   #recbar button { padding: 6px 14px; }
   #xpanel { display: none; position: fixed; inset: 0; z-index: 11; background: var(--bg); flex-direction: column; }
@@ -122,7 +124,7 @@
   <button id="macroBtn">Macros</button>
   <button id="connect">Connect</button>
 </header>
-<div id="recbar"><span id="recText"></span><button id="recStop">Stop</button></div>
+<div id="recbar"><span id="recText"></span><button id="recPause" class="pausebtn">Pause</button><button id="recStop">Stop</button></div>
 <div id="err"></div>
 
 <div id="mpanel">
@@ -261,8 +263,9 @@
   </div>
   <div style="padding: 8px 8px 0">
     <textarea id="bulk" placeholder="Paste a block of text here, then tap Send text"></textarea>
-    <div class="row r2" style="padding: 6px 0 0">
+    <div class="row r3" style="padding: 6px 0 0">
       <button id="sendBulk">Send text</button>
+      <button id="pauseBulk" class="pausebtn">Pause</button>
       <button id="stopBulk">Stop</button>
     </div>
   </div>
@@ -415,6 +418,7 @@ async function openGattOnce() {
 
 function onDisconnected() {
   connected = false; rxChar = null; cfgChar = null;
+  setPaused(false, false);   // the Flipper drops its queue on disconnect
   leftLocked = false; $("lock").classList.remove("on"); $("lock").textContent = "Hold click"; // Flipper releases buttons on disconnect
   setStatus("Disconnected", false);
   $("connect").textContent = "Connect";
@@ -439,6 +443,7 @@ let pumping = false;
 const MAX_WRITE = 180;
 
 function send(...bytes) {
+  if (paused && !(bytes.length === 1 && bytes[0] === OP.RELEASE)) return;   // ignore new input while paused
   recordBytes(bytes);
   if (!connected) return;   // don't pile up input to dump on the PC at reconnect
   queue.push(...bytes); pump();
@@ -463,9 +468,9 @@ async function pump() {
   try {
     for (;;) {
       if ((delayDirty || stopPending) && cfgChar) {   // settings go through the same one-at-a-time queue
-        const d = typeDelay(), stop = stopPending ? 1 : 0;
+        const d = typeDelay(), flags = (stopPending ? 1 : 0) | (paused ? 2 : 0);
         delayDirty = false; stopPending = false;
-        await cfgChar.writeValueWithResponse(new Uint8Array([d & 0xFF, d >> 8, stop]));
+        await cfgChar.writeValueWithResponse(new Uint8Array([d & 0xFF, d >> 8, flags]));
       }
       flushMotion();
       if (!queue.length) break;
@@ -596,7 +601,7 @@ $("raw").onchange = (e) => {
 // ---------------- letter delay ----------------
 // Pause the Flipper makes after each typed letter. Higher = slower typing,
 // for apps or PCs that drop letters. Remembered on this phone.
-let delayDirty = false, stopPending = false;
+let delayDirty = false, stopPending = false, paused = false;
 // Slider positions -> ms (fine steps at the fast end, big steps at the slow end)
 const DELAY_STEPS = [0, 1, 2, 3, 5, 8, 10, 15, 20, 25, 30, 40, 50, 60, 75, 100, 125, 150, 200, 250,
                      300, 400, 500, 600, 750, 1000, 1250, 1500, 2000, 3000, 4000, 5000];
@@ -604,7 +609,28 @@ function typeDelay() { return DELAY_STEPS[Math.max(0, Math.min(DELAY_STEPS.lengt
 // Rough time the Flipper needs per letter (~4 ms of USB key press/release + the delay)
 function msPerLetter() { return (cfgChar ? typeDelay() : 2) + 4; }
 // Tell the Flipper to stop typing and drop whatever it still has queued
-function stopTyping() { queue = []; stopPending = true; pump(); }
+function stopTyping() { queue = []; setPaused(false, false); stopPending = true; pump(); }
+
+// Pause: the Flipper holds everything it has queued (mid-text too) until Resume.
+// Sent text and macros wait as well, and new touchpad/keyboard input is ignored.
+function setPaused(on, tell = true) {
+  paused = on;
+  document.querySelectorAll(".pausebtn").forEach((b) => { b.textContent = on ? "Resume" : "Pause"; b.classList.toggle("on", on); });
+  if (on) setStatus("Paused", connected);
+  else if (connected) setStatus("Connected: " + device.name, true);
+  if (tell) { delayDirty = true; pump(); }
+}
+// Wait ms of un-paused time (paused time doesn't count); stops early when cancelled() is true
+async function runningWait(ms, cancelled) {
+  let left = ms, last = performance.now();
+  while (left > 0 && !cancelled()) {
+    await sleep(Math.min(50, Math.max(1, left)));
+    const now = performance.now();
+    if (!paused) left -= now - last;
+    last = now;
+  }
+}
+async function whilePaused(cancelled) { while (paused && !cancelled()) await sleep(50); }
 (function () {
   const el = $("typeDelay"), out = $("typeDelayVal");
   try {
@@ -630,14 +656,16 @@ $("sendBulk").onclick = async () => {
   const text = toAscii($("bulk").value);
   bulkCancel = false;
   for (let i = 0; i < text.length && !bulkCancel; i += 100) {
+    await whilePaused(() => bulkCancel);
+    if (bulkCancel) break;
     typeText(text.slice(i, i + 100));
-    setStatus(`Typing ${Math.min(i + 100, text.length)}/${text.length}…`, connected);
+    if (!paused) setStatus(`Typing ${Math.min(i + 100, text.length)}/${text.length}…`, connected);
     // don't send faster than the Flipper types (its buffer is 2 KB); wake up early on Stop
-    const until = performance.now() + 100 * msPerLetter();
-    while (!bulkCancel && performance.now() < until) await sleep(50);
+    await runningWait(100 * msPerLetter(), () => bulkCancel);
   }
   if (connected) setStatus("Connected: " + device.name, true);
 };
+$("pauseBulk").onclick = () => { if (connected) setPaused(!paused); };
 $("stopBulk").onclick = () => { bulkCancel = true; stopTyping(); send(OP.RELEASE); };
 
 // ---------------- mouse buttons ----------------
@@ -838,7 +866,7 @@ function showBar() {
 // ---- playback ----
 let stopFlag = false;
 async function waitIdle() { while (connected && (pumping || queue.length)) await sleep(10); }
-async function wait(ms) { const end = performance.now() + ms; while (!stopFlag && performance.now() < end) await sleep(Math.min(50, end - performance.now())); }
+async function wait(ms) { await runningWait(ms, () => stopFlag); }
 async function runStep(s) {
   const clamp = (v) => Math.max(-127, Math.min(127, v));
   switch (s.t) {
@@ -846,6 +874,8 @@ async function runStep(s) {
       const t = toAscii(s.s || "");
       for (let i = 0; i < t.length && !stopFlag; i += 100) {
         const part = t.slice(i, i + 100);
+        await whilePaused(() => stopFlag);
+        if (stopFlag) break;
         typeText(part); await waitIdle(); await wait(part.length * msPerLetter() + 30);  // let the Flipper finish typing
       }
       break;
@@ -853,6 +883,8 @@ async function runStep(s) {
     case "key": {
       const p = parseKey(s.k), n = Math.max(1, Math.min(999, Math.round(+s.n || 1)));
       if (p) for (let i = 0; i < n && !stopFlag; i++) {
+        await whilePaused(() => stopFlag);   // input is ignored while paused, so wait instead
+        if (stopFlag) break;
         send(OP.TAP, p.m, p.k);
         if (n > 1) { await waitIdle(); await wait(40); }   // small gap so apps register every press
       }
@@ -886,6 +918,8 @@ async function playMacro(name, reps = 1, mark = false) {
       for (let i = 0; i < list.length && !stopFlag && connected; i++) {
         $("recText").textContent = `▶ Playing "${name}": step ${i + 1}/${list.length}` + (reps > 1 ? `, run ${r + 1}/${reps}` : "");
         if (mark) markStep(i);
+        await whilePaused(() => stopFlag || !connected);
+        if (stopFlag || !connected) break;
         await runStep(list[i]);
       }
     }
@@ -986,6 +1020,7 @@ $("mdel").onclick = () => {
 $("mclear").onclick = () => { if (steps().length && confirm("Remove every step from this macro?")) { macros[curName] = []; save(); renderSteps(); } };
 $("addStep").onclick = () => { steps().push(NEW_STEP[$("addType").value]()); save(); renderSteps(); $("steps").lastChild.scrollIntoView?.({ block: "nearest" }); };
 $("recBtn").onclick = () => recording ? stopRec() : startRec();
+$("recPause").onclick = () => { if (connected) setPaused(!paused); };
 $("recStop").onclick = () => { if (recording) stopRec(); else stopPlay(); };
 $("playBtn").onclick = play;
 

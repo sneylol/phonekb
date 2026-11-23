@@ -230,9 +230,19 @@ static bool letter_pause(PhoneKb* app) {
     return true;
 }
 
+// Hold here while the phone has paused typing. Returns false if typing should stop.
+static bool wait_while_paused(PhoneKb* app) {
+    while(ble_profile_phone_kb_is_paused(app->profile)) {
+        furi_delay_ms(10);
+        if(typing_should_stop(app)) return false;
+    }
+    return true;
+}
+
 // Returns false if typing should stop.
 static bool type_char(PhoneKb* app, uint8_t c) {
     if(typing_should_stop(app)) return false;
+    if(!wait_while_paused(app)) return false;
     uint16_t key;
     if(c == '\n' || c == '\r') {
         key = HID_KEYBOARD_RETURN;
@@ -385,9 +395,13 @@ static void draw_cb(Canvas* canvas, void* context) {
     if(app->rejected) {
         phone = "Phone: wrong key!";
     } else if(app->ble_connected) {
-        phone = (ble_profile_phone_kb_get_auth(app->profile) == PhoneKbAuthOk) ?
-                    "Phone: connected" :
-                    "Phone: checking key...";
+        if(ble_profile_phone_kb_get_auth(app->profile) != PhoneKbAuthOk) {
+            phone = "Phone: checking key...";
+        } else if(ble_profile_phone_kb_is_paused(app->profile)) {
+            phone = "Phone: PAUSED";
+        } else {
+            phone = "Phone: connected";
+        }
     }
     canvas_draw_str(canvas, 2, 24, phone);
     canvas_draw_str(
@@ -445,10 +459,25 @@ int32_t phone_kb_app(void* p) {
     bool usb_was_connected = false;
     PhoneKbAuthStatus shown_auth = PhoneKbAuthWaiting;
     bool shown_connected = false;
+    bool shown_paused = false;
     uint32_t logged_dropped = 0;
     while(running) {
-        size_t n = furi_stream_buffer_receive(app->rx, chunk, sizeof(chunk), 30);
+        // While paused, leave everything queued where it is
+        bool paused = ble_profile_phone_kb_is_paused(app->profile);
+        size_t n = 0;
+        if(paused) {
+            furi_delay_ms(30);
+        } else {
+            n = furi_stream_buffer_receive(app->rx, chunk, sizeof(chunk), 30);
+        }
         if(n > 0) process_bytes(app, chunk, n);
+
+        paused = ble_profile_phone_kb_is_paused(app->profile);
+        if(paused != shown_paused) {
+            shown_paused = paused;
+            event_log(paused ? "paused" : "resumed");
+            view_port_update(app->view_port);
+        }
 
         // Stop tapped on the phone while nothing was being typed: drop what's queued
         uint32_t stops = ble_profile_phone_kb_get_stop_count(app->profile);
@@ -482,6 +511,8 @@ int32_t phone_kb_app(void* p) {
             shown_connected = ble_connected;
             phone_kb_link_changed(app, ble_connected);
             event_log("phone %s", ble_connected ? "connected" : "disconnected");
+            // Don't keep typing for a phone that's gone
+            if(!ble_connected) clear_queue(app);
         }
 
         uint32_t dropped = app->rx_dropped;
