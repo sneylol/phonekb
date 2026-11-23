@@ -283,6 +283,22 @@
 // ---- Flipper serial GATT (same UUIDs as the Flipper firmware) ----
 const SERVICE = "8fe5b3d5-2e7f-4a98-2a48-7acc60fe0000";
 const RX_CHAR = "19ed82ae-ed21-4c9d-4145-228e62fe0000"; // phone -> Flipper
+// No-PIN Flipper app: the page proves itself with a saved random secret instead of Bluetooth pairing
+const AUTH_CHAR = "19ed82ae-ed21-4c9d-4145-228e65fe0000";   // write 16-byte secret
+const STATUS_CHAR = "19ed82ae-ed21-4c9d-4145-228e66fe0000"; // read: 0 waiting, 1 ok, 2 rejected
+
+// Random secret for this browser, created once and kept in localStorage.
+// The Flipper remembers the first secret it receives (hold Left on the Flipper to reset).
+function getSecret() {
+  let hex = null;
+  try { hex = localStorage.getItem("phonekb.secret"); } catch (e) {}
+  if (!hex || !/^[0-9a-f]{32}$/.test(hex)) {
+    const b = crypto.getRandomValues(new Uint8Array(16));
+    hex = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+    try { localStorage.setItem("phonekb.secret", hex); } catch (e) {}
+  }
+  return new Uint8Array(hex.match(/../g).map((h) => parseInt(h, 16)));
+}
 
 // ---- protocol opcodes (must match phone_kb.c) ----
 const OP = { TAP: 1, MOVE: 2, DOWN: 3, UP: 4, SCROLL: 5, RELEASE: 6, CONSUMER: 7, TEXT: 8, KDOWN: 9, KUP: 10 };
@@ -332,7 +348,7 @@ async function openGatt() {
     for (let attempt = 1; ; attempt++) {
       try { await openGattOnce(); return; }
       catch (e) {
-        const pinProblem = /^Pairing failed/.test(e.message);
+        const pinProblem = /^(Pairing failed|Wrong key)/.test(e.message);
         if (pinProblem || !wantConnected) throw e;
         if (attempt >= 4) throw new Error("Couldn't connect after 4 tries. Make sure Phone Keyboard is open on the Flipper and nothing else is connected to it, then tap Connect again. (" + e.message + ")");
         try { device.gatt.disconnect(); } catch (_) {}
@@ -353,9 +369,27 @@ async function openGattOnce() {
   if (!device.gatt.connected) throw new Error("Link dropped right after connecting");
   const svc = await server.getPrimaryService(SERVICE);
   rxChar = await svc.getCharacteristic(RX_CHAR);
-  // First write needs an encrypted, bonded link. Android shows its pairing
-  // dialog here: type the 6-digit PIN that appears on the Flipper's screen.
-  setStatus("Pairing… enter the PIN shown on the Flipper", false);
+  let authChar = null, statusChar = null;
+  try {
+    authChar = await svc.getCharacteristic(AUTH_CHAR);
+    statusChar = await svc.getCharacteristic(STATUS_CHAR);
+  } catch (_) { /* older Flipper app: uses Bluetooth PIN pairing instead */ }
+  if (authChar && statusChar) {
+    // No-PIN Flipper app: send our secret, then wait for the verdict
+    setStatus("Checking key…", false);
+    await authChar.writeValueWithResponse(getSecret());
+    let st = 0;
+    for (let i = 0; i < 20 && st === 0; i++) {
+      st = (await statusChar.readValue()).getUint8(0);
+      if (st === 0) await sleep(100);
+    }
+    if (st === 2) throw new Error("Wrong key: this Flipper is linked to another phone or browser. To link this one, hold Left on the Flipper, then tap Connect again.");
+    if (st !== 1) throw new Error("The Flipper didn't answer the key check");
+  } else {
+    // First write needs an encrypted, bonded link. Android shows its pairing
+    // dialog here: type the 6-digit PIN that appears on the Flipper's screen.
+    setStatus("Pairing… enter the PIN shown on the Flipper", false);
+  }
   // Android can reject writes with "GATT operation already in progress" while
   // it is still bonding or discovering services, so keep retrying for ~30 s.
   for (let attempt = 0; attempt < 8; attempt++) {

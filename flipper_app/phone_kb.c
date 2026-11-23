@@ -3,7 +3,12 @@
  *
  * Phone  --BLE-->  Flipper  --USB HID-->  PC
  *
- * The phone writes small binary packets to the Flipper serial characteristic.
+ * No Bluetooth pairing / PIN. After connecting, the phone writes a 16-byte
+ * secret to the AUTH characteristic. The first secret the Flipper ever sees is
+ * saved to the SD card; after that only a phone with the same secret is
+ * accepted. Hold Left to forget it. See phone_kb_profile.h.
+ *
+ * The phone then writes small binary packets to the RX characteristic.
  * Several packets may be concatenated in one BLE write.
  *
  *   0x01 mods key        tap a key (mods = standard HID modifier bitmask)
@@ -32,6 +37,7 @@
 
 #define TAG              "PhoneKB"
 #define KEYS_PATH        APP_DATA_PATH(".phone_kb.keys")
+#define TOKEN_PATH       APP_DATA_PATH(".phone_kb.token")
 #define RX_BUF_SIZE      2048
 #define CHUNK_SIZE       128
 #define TYPE_KEY_DELAY_MS 2
@@ -60,6 +66,12 @@ typedef struct {
     FuriHalUsbInterface* usb_prev;
 
     volatile bool ble_connected;
+
+    // Secret of the phone this Flipper is linked to
+    uint8_t token[PHONE_KB_TOKEN_LEN];
+    volatile bool has_token;
+    volatile bool token_save_pending;
+    volatile bool rejected; // last phone sent the wrong secret
     uint32_t keys_sent;
     char last_text[22];
 
@@ -71,24 +83,68 @@ typedef struct {
 // ---------------------------------------------------------------- BLE side
 
 // Runs in the BLE/GAP thread: only copy bytes, never block on USB here.
-static uint16_t phone_kb_serial_cb(SerialServiceEvent event, void* context) {
+static void phone_kb_rx_cb(const uint8_t* data, uint16_t size, void* context) {
     PhoneKb* app = context;
-    if(event.event == SerialServiceEventTypeDataReceived) {
-        size_t sent = furi_stream_buffer_send(app->rx, event.data.buffer, event.data.size, 0);
-        if(sent != event.data.size) FURI_LOG_W(TAG, "RX overflow, dropped %u", event.data.size - sent);
-        return furi_stream_buffer_spaces_available(app->rx);
+    size_t sent = furi_stream_buffer_send(app->rx, data, size, 0);
+    if(sent != size) FURI_LOG_W(TAG, "RX overflow, dropped %u", size - sent);
+}
+
+// Runs in the BLE/GAP thread. First secret ever seen is adopted (saved later
+// by the main loop); after that it must match.
+static bool phone_kb_auth_cb(const uint8_t token[PHONE_KB_TOKEN_LEN], void* context) {
+    PhoneKb* app = context;
+    bool ok;
+    if(!app->has_token) {
+        memcpy(app->token, token, PHONE_KB_TOKEN_LEN);
+        app->has_token = true;
+        app->token_save_pending = true;
+        ok = true;
+    } else {
+        uint8_t diff = 0;
+        for(size_t i = 0; i < PHONE_KB_TOKEN_LEN; i++) diff |= app->token[i] ^ token[i];
+        ok = (diff == 0);
     }
-    return 0;
+    app->rejected = !ok;
+    return ok;
+}
+
+static void token_load(PhoneKb* app) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file = storage_file_alloc(storage);
+    app->has_token = storage_file_open(file, TOKEN_PATH, FSAM_READ, FSOM_OPEN_EXISTING) &&
+                     storage_file_read(file, app->token, PHONE_KB_TOKEN_LEN) == PHONE_KB_TOKEN_LEN;
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+}
+
+static void token_save(PhoneKb* app) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file = storage_file_alloc(storage);
+    if(!storage_file_open(file, TOKEN_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS) ||
+       storage_file_write(file, app->token, PHONE_KB_TOKEN_LEN) != PHONE_KB_TOKEN_LEN) {
+        FURI_LOG_E(TAG, "Failed to save phone secret");
+    }
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+}
+
+static void token_forget(PhoneKb* app) {
+    app->has_token = false;
+    app->rejected = false;
+    memset(app->token, 0, sizeof(app->token));
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    storage_simply_remove(storage, TOKEN_PATH);
+    furi_record_close(RECORD_STORAGE);
 }
 
 static void phone_kb_bt_status_cb(BtStatus status, void* context) {
     PhoneKb* app = context;
     bool connected = (status == BtStatusConnected);
     app->ble_connected = connected;
+    // Every new link has to present the secret again
+    ble_profile_phone_kb_reset_auth(app->profile);
     if(connected) {
-        // Callback is cleared by the service on disconnect, so re-arm each time
-        ble_profile_phone_kb_set_callback(app->profile, RX_BUF_SIZE, phone_kb_serial_cb, app);
-        ble_profile_phone_kb_notify_buffer_is_empty(app->profile);
+        app->rejected = false;
         notification_internal_message(app->notifications, &sequence_set_blue_255);
     } else {
         notification_internal_message(app->notifications, &sequence_reset_blue);
@@ -224,8 +280,15 @@ static void draw_cb(Canvas* canvas, void* context) {
     canvas_draw_str(canvas, 2, 11, "Phone Keyboard");
 
     canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str(
-        canvas, 2, 24, app->ble_connected ? "Phone: connected" : "Phone: waiting...");
+    const char* phone = "Phone: waiting...";
+    if(app->rejected) {
+        phone = "Phone: wrong key!";
+    } else if(app->ble_connected) {
+        phone = (ble_profile_phone_kb_get_auth(app->profile) == PhoneKbAuthOk) ?
+                    "Phone: connected" :
+                    "Phone: checking key...";
+    }
+    canvas_draw_str(canvas, 2, 24, phone);
     canvas_draw_str(
         canvas, 2, 35, furi_hal_hid_is_connected() ? "PC (USB): connected" : "PC (USB): plug in cable");
 
@@ -234,7 +297,7 @@ static void draw_cb(Canvas* canvas, void* context) {
     canvas_draw_str(canvas, 2, 46, buf);
     canvas_draw_str(canvas, 2, 56, app->last_text);
 
-    canvas_draw_str(canvas, 70, 64, "Hold < unpair");
+    canvas_draw_str(canvas, 58, 64, app->has_token ? "Hold < new phone" : "Any phone links");
 }
 
 static void input_cb(InputEvent* event, void* context) {
@@ -262,6 +325,8 @@ int32_t phone_kb_app(void* p) {
     furi_hal_usb_unlock();
     furi_check(furi_hal_usb_set_config(&usb_hid, NULL));
 
+    token_load(app);
+
     // BLE: swap the system profile for ours
     app->bt = furi_record_open(RECORD_BT);
     bt_disconnect(app->bt);
@@ -269,7 +334,7 @@ int32_t phone_kb_app(void* p) {
     bt_keys_storage_set_storage_path(app->bt, KEYS_PATH);
     app->profile = bt_profile_start(app->bt, ble_profile_phone_kb, NULL);
     furi_check(app->profile);
-    ble_profile_phone_kb_set_callback(app->profile, RX_BUF_SIZE, phone_kb_serial_cb, app);
+    ble_profile_phone_kb_set_callbacks(app->profile, phone_kb_rx_cb, phone_kb_auth_cb, app);
     furi_hal_bt_start_advertising();
     bt_set_status_changed_callback(app->bt, phone_kb_bt_status_cb, app);
 
@@ -278,11 +343,20 @@ int32_t phone_kb_app(void* p) {
     bool usb_was_connected = false;
     while(running) {
         size_t n = furi_stream_buffer_receive(app->rx, chunk, sizeof(chunk), 30);
-        if(n > 0) {
-            process_bytes(app, chunk, n);
-            if(furi_stream_buffer_is_empty(app->rx) && app->ble_connected) {
-                ble_profile_phone_kb_notify_buffer_is_empty(app->profile);
-            }
+        if(n > 0) process_bytes(app, chunk, n);
+
+        if(app->token_save_pending) {
+            app->token_save_pending = false;
+            token_save(app);
+            notification_message(app->notifications, &sequence_success);
+        }
+
+        // Status line ("checking key" -> "connected"/"wrong key") changes in the BLE thread
+        static PhoneKbAuthStatus shown_auth = PhoneKbAuthWaiting;
+        PhoneKbAuthStatus auth = ble_profile_phone_kb_get_auth(app->profile);
+        if(auth != shown_auth) {
+            shown_auth = auth;
+            view_port_update(app->view_port);
         }
 
         bool usb_connected = furi_hal_hid_is_connected();
@@ -296,13 +370,13 @@ int32_t phone_kb_app(void* p) {
             if(ev.key == InputKeyBack && ev.type == InputTypeShort) {
                 running = false;
             } else if(ev.key == InputKeyLeft && ev.type == InputTypeLong) {
-                // Forget the paired phone (it will need to pair again)
+                // Forget the linked phone: the next phone that connects becomes the new one
+                token_forget(app);
                 bt_disconnect(app->bt);
                 furi_delay_ms(200);
-                furi_hal_bt_stop_advertising();
-                bt_forget_bonded_devices(app->bt);
                 furi_hal_bt_start_advertising();
                 notification_message(app->notifications, &sequence_success);
+                view_port_update(app->view_port);
             }
         }
     }

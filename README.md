@@ -27,7 +27,7 @@ The computer needs **no drivers, no software and no Bluetooth**. It just sees a 
 - **Remote:** sort macros into groups (e.g. Work, Gaming) and get a page of big buttons, one tap per macro
 - **Send a block of text:** paste a paragraph on the phone and have it typed out on the PC
 - **Works offline:** install it from Chrome and it runs with no internet
-- **Secure:** the Bluetooth link is PIN-paired and encrypted, so nearby devices can't inject keystrokes
+- **No pairing codes (Momentum mntm-012 build):** the page keeps a random secret key and the Flipper only accepts the first phone that connects, so other nearby devices can't type on your PC. The link isn't Bluetooth-encrypted, so someone sniffing Bluetooth nearby could read what you type. The other `.fap` builds still use a 6-digit PIN.
 
 ## Requirements
 
@@ -70,9 +70,9 @@ Open **https://carlantaya.github.io/phonekb/** in **Chrome on Android**, then us
 2. Close the Flipper phone app and qFlipper, so nothing else is connected to the Flipper.
 3. On the Flipper, open **Apps → USB → Phone Keyboard**.
 4. On the phone, make sure **Bluetooth and Location** are on, tap **Connect**, and choose **PhoneKB …**.
-5. The first time, Android asks for a PIN: type the **6 digits shown on the Flipper**.
+5. With the mntm-012 build there's no PIN: the first phone that connects is linked automatically. With the other builds, the first time the phone asks for a PIN: type the **6 digits shown on the Flipper**.
 
-On the Flipper: **Back** exits, **hold Left** forgets the paired phone.
+On the Flipper: **Back** exits, **hold Left** forgets the linked phone (the next phone that connects becomes the linked one).
 
 ## Troubleshooting
 
@@ -80,7 +80,8 @@ On the Flipper: **Back** exits, **hold Left** forgets the paired phone.
 |---|---|
 | "Web Bluetooth isn't available" | Use Chrome on Android, and open the https:// link (not a downloaded file). |
 | PhoneKB doesn't appear in the list | Make sure the app is open on the Flipper, phone Location is on, and the Flipper phone app is closed. |
-| Pairing fails | Hold Left on the Flipper to forget old pairings, remove "PhoneKB" from Android's Bluetooth settings, and try again. |
+| "Wrong key" | The Flipper is linked to another phone or browser (or this browser's data was cleared). Hold Left on the Flipper, then tap Connect. |
+| Pairing fails (PIN builds) | Hold Left on the Flipper to forget old pairings, remove "PhoneKB" from Android's Bluetooth settings, and try again. |
 | Flipper crashes with "HardFault" | Wrong `.fap` for your firmware version; see the table above. |
 | Wrong symbols typed | The PC must use the US keyboard layout. Accented letters and emoji are skipped. |
 
