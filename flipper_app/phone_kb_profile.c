@@ -64,7 +64,7 @@ static const BleGattCharacteristicParams phone_kb_chars[PhoneKbCharCount] = {
     [PhoneKbCharAuth] =
         {.name = "Auth",
          .data_prop_type = FlipperGattCharacteristicDataFixed,
-         .data.fixed.length = PHONE_KB_TOKEN_LEN,
+         .data.fixed.length = PHONE_KB_TOKEN_LEN + 1,
          .uuid.Char_UUID_128 = PHONE_KB_CHAR_UUID(0x65),
          .uuid_type = UUID_TYPE_128,
          .char_properties = CHAR_PROP_WRITE,
@@ -106,6 +106,7 @@ typedef struct {
     PhoneKbAuthStatus published; // value last written to the STATUS characteristic
     volatile uint16_t letter_delay_ms;
     volatile uint32_t stop_count;
+    volatile uint32_t release_count;
     volatile bool paused;
     volatile uint8_t layout;
     volatile bool link_up;
@@ -162,8 +163,11 @@ static BleEventAckStatus phone_kb_event_handler(void* event, void* context) {
 
     if(mod->Attr_Handle == p->chars[PhoneKbCharAuth].handle + 1) {
         bool ok = false;
-        if(mod->Attr_Data_Length == PHONE_KB_TOKEN_LEN && p->auth_callback) {
-            ok = p->auth_callback(mod->Attr_Data, p->context);
+        uint16_t len = mod->Attr_Data_Length;
+        if((len == PHONE_KB_TOKEN_LEN || len == PHONE_KB_TOKEN_LEN + 1) && p->auth_callback) {
+            // Older pages send only the secret: treat that as a user-initiated connect
+            bool user_initiated = (len == PHONE_KB_TOKEN_LEN) || (mod->Attr_Data[PHONE_KB_TOKEN_LEN] & 1);
+            ok = p->auth_callback(mod->Attr_Data, user_initiated, p->context);
         }
         p->auth = ok ? PhoneKbAuthOk : PhoneKbAuthRejected;
         return BleEventAckFlowEnable;
@@ -176,6 +180,7 @@ static BleEventAckStatus phone_kb_event_handler(void* event, void* context) {
             p->letter_delay_ms = ms;
             if(mod->Attr_Data_Length >= 3) {
                 if(mod->Attr_Data[2] & 1) p->stop_count++;
+                if(mod->Attr_Data[2] & 4) p->release_count++;
                 p->paused = (mod->Attr_Data[2] & 2) != 0;
             }
             if(mod->Attr_Data_Length >= 4) p->layout = mod->Attr_Data[3];
@@ -327,4 +332,9 @@ bool ble_profile_phone_kb_is_paused(FuriHalBleProfileBase* profile) {
 PhoneKbLayout ble_profile_phone_kb_get_layout(FuriHalBleProfileBase* profile) {
     furi_check(profile && (profile->config == ble_profile_phone_kb));
     return (PhoneKbLayout)((BleProfilePhoneKb*)profile)->layout;
+}
+
+uint32_t ble_profile_phone_kb_get_release_count(FuriHalBleProfileBase* profile) {
+    furi_check(profile && (profile->config == ble_profile_phone_kb));
+    return ((BleProfilePhoneKb*)profile)->release_count;
 }

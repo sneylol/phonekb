@@ -17,12 +17,14 @@ extern "C" {
  *
  * Service: 8fe5b3d5-2e7f-4a98-2a48-7acc60fe0000 (same UUID as Flipper serial)
  *   RX     19ed82ae-ed21-4c9d-4145-228e62fe0000  write          command bytes
- *   AUTH   19ed82ae-ed21-4c9d-4145-228e65fe0000  write          16-byte secret
+ *   AUTH   19ed82ae-ed21-4c9d-4145-228e65fe0000  write          16-byte secret [+ 1 byte: 1 = the user
+ *                                                                tapped Connect, 0 = automatic reconnect]
  *   STATUS 19ed82ae-ed21-4c9d-4145-228e66fe0000  read           0 waiting, 1 ok, 2 rejected
  *   CONFIG 19ed82ae-ed21-4c9d-4145-228e67fe0000  write          [0..1] = ms to wait after each typed
  *                                                                letter (little-endian; 1 byte also ok),
  *                                                                [2] bit 0 = stop typing what's queued
  *                                                                [2] bit 1 = paused (hold everything queued)
+ *                                                                [2] bit 2 = release all keys/buttons now
  *                                                                [3] = PC keyboard layout (PhoneKbLayout)
  */
 extern const FuriHalBleProfileTemplate* const ble_profile_phone_kb;
@@ -38,8 +40,14 @@ typedef enum {
 /** Called in the BLE event thread (tiny stack!) with bytes from an accepted phone. Must not block. */
 typedef void (*PhoneKbRxCallback)(const uint8_t* data, uint16_t size, void* context);
 
-/** Called in the BLE event thread (tiny stack!) with the phone's secret. Return true to accept. Must not block. */
-typedef bool (*PhoneKbAuthCallback)(const uint8_t token[PHONE_KB_TOKEN_LEN], void* context);
+/**
+ * Called in the BLE event thread (tiny stack!) with the phone's secret. Return true to accept.
+ * user_initiated is false when the page is reconnecting by itself. Must not block.
+ */
+typedef bool (*PhoneKbAuthCallback)(
+    const uint8_t token[PHONE_KB_TOKEN_LEN],
+    bool user_initiated,
+    void* context);
 
 void ble_profile_phone_kb_set_callbacks(
     FuriHalBleProfileBase* profile,
@@ -77,6 +85,9 @@ PhoneKbLayout ble_profile_phone_kb_get_layout(FuriHalBleProfileBase* profile);
 
 /** True while the phone has paused typing (CONFIG [2] bit 1). Cleared on disconnect. */
 bool ble_profile_phone_kb_is_paused(FuriHalBleProfileBase* profile);
+
+/** Increments each time the phone asks to release all keys/buttons (CONFIG [2] bit 2). */
+uint32_t ble_profile_phone_kb_get_release_count(FuriHalBleProfileBase* profile);
 
 /** Increments each time the phone asks to stop typing (CONFIG [2] bit 0). */
 uint32_t ble_profile_phone_kb_get_stop_count(FuriHalBleProfileBase* profile);

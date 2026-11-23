@@ -335,6 +335,7 @@ async function connect() {
       device.addEventListener("gattserverdisconnected", onDisconnected);
     }
     wantConnected = true;
+    freshConnect = true;     // the user tapped Connect: may link an unlinked Flipper
     await openGatt();
   } catch (e) {
     if (e.name !== "NotFoundError") showErr(String(e.message || e)); // NotFound = user cancelled picker
@@ -343,6 +344,7 @@ async function connect() {
 }
 
 let connecting = false;
+let freshConnect = false;    // false for automatic reconnects
 async function openGatt() {
   if (connecting) return;           // a connect is already running (e.g. auto-reconnect)
   connecting = true;
@@ -382,13 +384,21 @@ async function openGattOnce() {
   if (authChar && statusChar) {
     // No-PIN Flipper app: send our secret, then wait for the verdict
     setStatus("Checking key…", false);
-    await authChar.writeValueWithResponse(getSecret());
+    // Secret + whether the user tapped Connect. An automatic reconnect never
+    // links an unlinked Flipper (after "Hold Left" the old phone stays out).
+    const auth = new Uint8Array(17);
+    auth.set(getSecret());
+    auth[16] = freshConnect ? 1 : 0;
+    await authChar.writeValueWithResponse(auth);
     let st = 0;
     for (let i = 0; i < 20 && st === 0; i++) {
       st = (await statusChar.readValue()).getUint8(0);
       if (st === 0) await sleep(100);
     }
-    if (st === 2) throw new Error("Wrong key: this Flipper is linked to another phone or browser. To link this one, hold Left on the Flipper, then tap Connect again.");
+    if (st === 2) throw new Error(freshConnect
+      ? "Wrong key: this Flipper is linked to another phone or browser. To link this one, hold Left on the Flipper, then tap Connect again."
+      : "Wrong key: the Flipper was reset or linked to another phone. Tap Connect to link this phone.");
+    freshConnect = false;     // later reconnects of this session are automatic
     if (st !== 1) throw new Error("The Flipper didn't answer the key check");
     // Letter delay setting (older Flipper builds don't have it: then typing speed is fixed)
     try { cfgChar = await svc.getCharacteristic(CONFIG_CHAR); } catch (_) { cfgChar = null; }
@@ -418,6 +428,7 @@ async function openGattOnce() {
 
 function onDisconnected() {
   connected = false; rxChar = null; cfgChar = null;
+  queue = []; backlogMs = 0;   // the Flipper drops its queue on disconnect, so don't resend stale input
   setPaused(false, false);   // the Flipper drops its queue on disconnect
   leftLocked = false; $("lock").classList.remove("on"); $("lock").textContent = "Hold click"; // Flipper releases buttons on disconnect
   setStatus("Disconnected", false);
@@ -437,29 +448,57 @@ $("connect").onclick = () => {
 // ---------------- send queue ----------------
 // Web Bluetooth allows one GATT op at a time, so everything is queued and
 // coalesced; mouse motion is accumulated between writes for smoothness.
-let queue = [];             // bytes waiting
+// Each queue entry is one whole packet, and a write only ever contains whole
+// packets: if the Flipper has to drop a write, it never cuts a packet in half.
+let queue = [];             // packets waiting (each an array of bytes)
 let moveX = 0, moveY = 0, scrollAcc = 0;
-let pumping = false;
+let pumping = false, pumpTimer = null;
 const MAX_WRITE = 180;
+const TEXT_CHUNK = 150;     // max bytes of text per packet (fits in one write)
+
+// The Flipper types slowly with a long letter delay, and its buffer is only
+// 2 KB. Estimate how much typing it still has queued (ms) and don't send more
+// while that's high. Paused time doesn't count.
+const BACKLOG_MAX_MS = 400;
+let backlogMs = 0, backlogAt = performance.now();
+function backlog() {
+  const now = performance.now();
+  if (!paused) backlogMs = Math.max(0, backlogMs - (now - backlogAt));
+  backlogAt = now;
+  return backlogMs;
+}
+function packetCost(p) { return p[0] === OP.TEXT ? p[1] * msPerLetter() : 1; }
+
+let releasePending = false;
+const RELEASE_OPS = [OP.UP, OP.KUP, OP.RELEASE];
 
 function send(...bytes) {
-  if (paused && !(bytes.length === 1 && bytes[0] === OP.RELEASE)) return;   // ignore new input while paused
+  if (paused) {
+    // New input is ignored while paused, but letting go of a held button or key
+    // must still work: the Flipper releases everything right away (config flag).
+    if (RELEASE_OPS.includes(bytes[0]) && connected) { releasePending = true; pump(); }
+    return;
+  }
   recordBytes(bytes);
   if (!connected) return;   // don't pile up input to dump on the PC at reconnect
-  queue.push(...bytes); pump();
+  queue.push(bytes); pump();
 }
 
 function flushMotion() {
+  if (backlog() > 50) {     // the Flipper is busy typing: a late pointer jump is worse than none
+    moveX = moveY = scrollAcc = 0;
+    return;
+  }
   while (moveX !== 0 || moveY !== 0) {
     const dx = Math.max(-127, Math.min(127, Math.trunc(moveX)));
     const dy = Math.max(-127, Math.min(127, Math.trunc(moveY)));
     if (dx === 0 && dy === 0) break;
-    queue.push(OP.MOVE, dx & 0xFF, dy & 0xFF);
+    queue.push([OP.MOVE, dx & 0xFF, dy & 0xFF]);
     rec({ t: "move", x: dx, y: dy });
     moveX -= dx; moveY -= dy;
   }
   const s = Math.trunc(scrollAcc);
-  if (s !== 0) { const c = Math.max(-127, Math.min(127, s)); queue.push(OP.SCROLL, c & 0xFF); rec({ t: "scroll", n: c }); scrollAcc -= c; }
+  if (s !== 0) { const c = Math.max(-127, Math.min(127, s)); queue.push([OP.SCROLL, c & 0xFF]); rec({ t: "scroll", n: c }); scrollAcc -= c; }
 }
 
 async function pump() {
@@ -467,16 +506,27 @@ async function pump() {
   pumping = true;
   try {
     for (;;) {
-      if ((delayDirty || stopPending) && cfgChar) {   // settings go through the same one-at-a-time queue
-        const d = typeDelay(), flags = (stopPending ? 1 : 0) | (paused ? 2 : 0);
-        delayDirty = false; stopPending = false;
+      if ((delayDirty || stopPending || releasePending) && cfgChar) {   // settings use the same one-at-a-time queue
+        const d = typeDelay(), flags = (stopPending ? 1 : 0) | (paused ? 2 : 0) | (releasePending ? 4 : 0);
+        delayDirty = false; stopPending = false; releasePending = false;
         // [3] = PC layout, so the Flipper presses the right keys for y/z, umlauts, symbols
         await cfgChar.writeValueWithResponse(new Uint8Array([d & 0xFF, d >> 8, flags, GERMAN_PC ? 1 : 0]));
       }
       flushMotion();
       if (!queue.length) break;
-      const chunk = queue.splice(0, MAX_WRITE);
-      await rxChar.writeValueWithResponse(new Uint8Array(chunk));
+      if (backlog() > BACKLOG_MAX_MS) {  // let the Flipper catch up, then continue
+        if (!pumpTimer) pumpTimer = setTimeout(() => { pumpTimer = null; pump(); }, Math.min(250, backlogMs - BACKLOG_MAX_MS + 10));
+        break;
+      }
+      const out = [];
+      while (queue.length && out.length + queue[0].length <= MAX_WRITE) {
+        const cost = packetCost(queue[0]);
+        if (out.length && backlogMs + cost > BACKLOG_MAX_MS) break;
+        out.push(...queue.shift());
+        backlogMs += cost;
+      }
+      if (!out.length) { const p = queue.shift(); out.push(...p); backlogMs += packetCost(p); }  // (oversized packet)
+      await rxChar.writeValueWithResponse(new Uint8Array(out));
     }
   } catch (e) {
     showErr("Send failed: " + e.message);
@@ -549,8 +599,8 @@ function typeText(s) {
   }
   // Sent as UTF-8; the Flipper app decodes it (also across packet borders)
   const bytes = Array.from(new TextEncoder().encode(s));
-  for (let i = 0; i < bytes.length; i += 200) {
-    const part = bytes.slice(i, i + 200);
+  for (let i = 0; i < bytes.length; i += TEXT_CHUNK) {
+    const part = bytes.slice(i, i + TEXT_CHUNK);
     send(OP.TEXT, part.length, ...part);
   }
 }
@@ -607,10 +657,11 @@ let delayDirty = false, stopPending = false, paused = false;
 const DELAY_STEPS = [0, 1, 2, 3, 5, 8, 10, 15, 20, 25, 30, 40, 50, 60, 75, 100, 125, 150, 200, 250,
                      300, 400, 500, 600, 750, 1000, 1250, 1500, 2000, 3000, 4000, 5000];
 function typeDelay() { return DELAY_STEPS[Math.max(0, Math.min(DELAY_STEPS.length - 1, Math.round(+$("typeDelay").value)))]; }
-// Rough time the Flipper needs per letter (~4 ms of USB key press/release + the delay)
-function msPerLetter() { return (cfgChar ? typeDelay() : 2) + 4; }
+// Time the Flipper needs per letter: the delay plus the USB key press/release.
+// Kept on the safe side (8 ms), so the page never gets ahead of the Flipper.
+function msPerLetter() { return (cfgChar ? typeDelay() : 2) + 8; }
 // Tell the Flipper to stop typing and drop whatever it still has queued
-function stopTyping() { queue = []; setPaused(false, false); stopPending = true; pump(); }
+function stopTyping() { queue = []; backlogMs = 0; setPaused(false, false); stopPending = true; pump(); }
 
 // Pause: the Flipper holds everything it has queued (mid-text too) until Resume.
 // Sent text and macros wait as well, and new touchpad/keyboard input is ignored.

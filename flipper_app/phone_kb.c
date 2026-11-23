@@ -45,6 +45,10 @@
 #define EVENT_LOG_MAX    (16 * 1024)
 #define RX_BUF_SIZE      2048
 #define CHUNK_SIZE       128
+// A link must present the right secret within this time, or it is dropped
+// (so a stray or rejected device can't block the phone from connecting)
+#define AUTH_TIMEOUT_MS    5000
+#define REJECTED_LINGER_MS 1500 // long enough for the page to read "rejected"
 
 typedef enum {
     OpTap = 0x01,
@@ -80,6 +84,7 @@ typedef struct {
 
     // Typing can take minutes with a long letter delay, so it must be stoppable
     uint32_t stop_seen; // last stop request handled (see ble_profile_phone_kb_get_stop_count)
+    uint32_t release_seen; // last "release everything" request handled
     bool typing_aborted; // drop the rest of what's queued
     bool exit_requested; // Back pressed while typing
     bool forget_requested; // Hold Left pressed while typing
@@ -127,18 +132,34 @@ static void event_log_start(void) {
 }
 
 // Runs in the BLE event thread (tiny stack): only copy bytes, no logging, never block.
+// The page only puts whole packets in a write, so a write that doesn't fit is
+// dropped as a whole: storing part of it would cut a packet and the parser would
+// then read the following bytes (mouse moves, keys) as text.
 static void phone_kb_rx_cb(const uint8_t* data, uint16_t size, void* context) {
     PhoneKb* app = context;
-    size_t sent = furi_stream_buffer_send(app->rx, data, size, 0);
-    if(sent != size) app->rx_dropped += size - sent;
+    // Only this thread writes, so free space can only grow until the send
+    if(furi_stream_buffer_spaces_available(app->rx) < size) {
+        app->rx_dropped += size;
+        return;
+    }
+    furi_stream_buffer_send(app->rx, data, size, 0);
 }
 
-// Runs in the BLE event thread (tiny stack). First secret ever seen is adopted
-// (saved later by the main loop); after that it must match.
-static bool phone_kb_auth_cb(const uint8_t token[PHONE_KB_TOKEN_LEN], void* context) {
+// Runs in the BLE event thread (tiny stack). The first secret sent from a Connect
+// the user tapped is adopted (saved later by the main loop); after that it must
+// match. Automatic reconnects never claim an unlinked Flipper, so after
+// "Hold Left" the old phone's page can't silently re-link itself.
+static bool phone_kb_auth_cb(
+    const uint8_t token[PHONE_KB_TOKEN_LEN],
+    bool user_initiated,
+    void* context) {
     PhoneKb* app = context;
     bool ok;
     if(!app->has_token) {
+        if(!user_initiated) {
+            app->rejected = true;
+            return false;
+        }
         memcpy(app->token, token, PHONE_KB_TOKEN_LEN);
         app->has_token = true;
         app->token_save_pending = true;
@@ -234,10 +255,30 @@ static bool letter_pause(PhoneKb* app) {
     return true;
 }
 
+static void release_everything(PhoneKb* app) {
+    UNUSED(app);
+    furi_hal_hid_kb_release_all();
+    furi_hal_hid_consumer_key_release_all();
+    furi_hal_hid_mouse_release(HID_MOUSE_BTN_LEFT);
+    furi_hal_hid_mouse_release(HID_MOUSE_BTN_RIGHT);
+    furi_hal_hid_mouse_release(HID_MOUSE_BTN_WHEEL);
+}
+
+// The phone can ask to let go of held keys/buttons even while paused (when the
+// normal queue isn't being read), e.g. turning off "Hold click" during a pause.
+static void check_release_request(PhoneKb* app) {
+    uint32_t releases = ble_profile_phone_kb_get_release_count(app->profile);
+    if(releases != app->release_seen) {
+        app->release_seen = releases;
+        release_everything(app);
+    }
+}
+
 // Hold here while the phone has paused typing. Returns false if typing should stop.
 static bool wait_while_paused(PhoneKb* app) {
     while(ble_profile_phone_kb_is_paused(app->profile)) {
         furi_delay_ms(10);
+        check_release_request(app);
         if(typing_should_stop(app)) return false;
     }
     return true;
@@ -376,11 +417,7 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
         furi_hal_hid_mouse_scroll((int8_t)p[1]);
         break;
     case OpReleaseAll:
-        furi_hal_hid_kb_release_all();
-        furi_hal_hid_consumer_key_release_all();
-        furi_hal_hid_mouse_release(HID_MOUSE_BTN_LEFT);
-        furi_hal_hid_mouse_release(HID_MOUSE_BTN_RIGHT);
-        furi_hal_hid_mouse_release(HID_MOUSE_BTN_WHEEL);
+        release_everything(app);
         break;
     case OpConsumer: {
         uint16_t key = p[1] | ((uint16_t)p[2] << 8);
@@ -406,18 +443,18 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
 }
 
 // Throw away everything still queued from the phone (after Stop, a disconnect or Back)
-static void clear_queue(PhoneKb* app) {
+static void clear_queue(PhoneKb* app, bool was_typing) {
     app->pkt_len = 0;
     app->utf8_left = 0;
     uint8_t junk[64];
-    while(furi_stream_buffer_receive(app->rx, junk, sizeof(junk), 0) > 0) {
+    size_t dropped = 0, got;
+    while((got = furi_stream_buffer_receive(app->rx, junk, sizeof(junk), 0)) > 0) {
+        dropped += got;
     }
-    furi_hal_hid_kb_release_all();
-    furi_hal_hid_consumer_key_release_all();
-    furi_hal_hid_mouse_release(HID_MOUSE_BTN_LEFT);
-    furi_hal_hid_mouse_release(HID_MOUSE_BTN_RIGHT);
-    furi_hal_hid_mouse_release(HID_MOUSE_BTN_WHEEL);
-    event_log("typing stopped, queue cleared");
+    release_everything(app);
+    if(was_typing || dropped) {
+        event_log("typing stopped, %lu queued bytes dropped", (unsigned long)dropped);
+    }
 }
 
 static void process_bytes(PhoneKb* app, const uint8_t* data, size_t len) {
@@ -432,7 +469,7 @@ static void process_bytes(PhoneKb* app, const uint8_t* data, size_t len) {
     }
     if(app->typing_aborted) {
         app->typing_aborted = false;
-        clear_queue(app);
+        clear_queue(app, true);
     }
 }
 
@@ -514,6 +551,7 @@ int32_t phone_kb_app(void* p) {
     PhoneKbAuthStatus shown_auth = PhoneKbAuthWaiting;
     bool shown_connected = false;
     bool shown_paused = false;
+    uint32_t link_up_at = 0;
     uint32_t logged_dropped = 0;
     while(running) {
         // While paused, leave everything queued where it is
@@ -537,8 +575,9 @@ int32_t phone_kb_app(void* p) {
         uint32_t stops = ble_profile_phone_kb_get_stop_count(app->profile);
         if(stops != app->stop_seen) {
             app->stop_seen = stops;
-            clear_queue(app);
+            clear_queue(app, false);
         }
+        check_release_request(app);
 
         if(app->token_save_pending) {
             app->token_save_pending = false;
@@ -566,7 +605,23 @@ int32_t phone_kb_app(void* p) {
             phone_kb_link_changed(app, ble_connected);
             event_log("phone %s", ble_connected ? "connected" : "disconnected");
             // Don't keep typing for a phone that's gone
-            if(!ble_connected) clear_queue(app);
+            if(!ble_connected) clear_queue(app, false);
+            link_up_at = furi_get_tick();
+        }
+
+        // Drop a link that doesn't present the right secret in time
+        if(ble_connected) {
+            uint32_t up_for = furi_get_tick() - link_up_at;
+            bool drop = (auth == PhoneKbAuthWaiting && up_for > AUTH_TIMEOUT_MS) ||
+                        (auth == PhoneKbAuthRejected && up_for > REJECTED_LINGER_MS);
+            if(drop) {
+                event_log(
+                    "dropping phone link: %s", auth == PhoneKbAuthRejected ? "wrong key" : "no key sent");
+                bt_disconnect(app->bt);
+                furi_delay_ms(200);
+                furi_hal_bt_start_advertising();
+                link_up_at = furi_get_tick();
+            }
         }
 
         uint32_t dropped = app->rx_dropped;
