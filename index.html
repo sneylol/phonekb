@@ -268,6 +268,7 @@
   </div>
   <div class="settings">
     <label>Scroll <input id="scrollSpeed" type="range" min="0.2" max="3" step="0.1" value="1"></label>
+    <label>Letter delay <input id="typeDelay" type="range" min="0" max="100" step="1" value="2"> <output id="typeDelayVal">2 ms</output></label>
     <label><input id="raw" type="checkbox"> No autocorrect</label>
   </div>
 </div>
@@ -286,6 +287,7 @@ const RX_CHAR = "19ed82ae-ed21-4c9d-4145-228e62fe0000"; // phone -> Flipper
 // No-PIN Flipper app: the page proves itself with a saved random secret instead of Bluetooth pairing
 const AUTH_CHAR = "19ed82ae-ed21-4c9d-4145-228e65fe0000";   // write 16-byte secret
 const STATUS_CHAR = "19ed82ae-ed21-4c9d-4145-228e66fe0000"; // read: 0 waiting, 1 ok, 2 rejected
+const CONFIG_CHAR = "19ed82ae-ed21-4c9d-4145-228e67fe0000"; // write: [0] = ms pause after each typed letter
 
 // Random secret for this browser, created once and kept in localStorage.
 // The Flipper remembers the first secret it receives (hold Left on the Flipper to reset).
@@ -305,7 +307,7 @@ const OP = { TAP: 1, MOVE: 2, DOWN: 3, UP: 4, SCROLL: 5, RELEASE: 6, CONSUMER: 7
 const KEY = { ENTER: 0x28, BKSP: 0x2A, TAB: 0x2B, SPACE: 0x2C };
 
 const $ = (id) => document.getElementById(id);
-let device = null, rxChar = null, connected = false, wantConnected = false;
+let device = null, rxChar = null, cfgChar = null, connected = false, wantConnected = false;
 
 function setStatus(text, ok) {
   $("status").textContent = text;
@@ -385,6 +387,9 @@ async function openGattOnce() {
     }
     if (st === 2) throw new Error("Wrong key: this Flipper is linked to another phone or browser. To link this one, hold Left on the Flipper, then tap Connect again.");
     if (st !== 1) throw new Error("The Flipper didn't answer the key check");
+    // Letter delay setting (older Flipper builds don't have it: then typing speed is fixed)
+    try { cfgChar = await svc.getCharacteristic(CONFIG_CHAR); } catch (_) { cfgChar = null; }
+    delayDirty = true;
   } else {
     // First write needs an encrypted, bonded link. Android shows its pairing
     // dialog here: type the 6-digit PIN that appears on the Flipper's screen.
@@ -409,7 +414,7 @@ async function openGattOnce() {
 }
 
 function onDisconnected() {
-  connected = false; rxChar = null;
+  connected = false; rxChar = null; cfgChar = null;
   leftLocked = false; $("lock").classList.remove("on"); $("lock").textContent = "Hold click"; // Flipper releases buttons on disconnect
   setStatus("Disconnected", false);
   $("connect").textContent = "Connect";
@@ -457,6 +462,10 @@ async function pump() {
   pumping = true;
   try {
     for (;;) {
+      if (delayDirty && cfgChar) {   // send the letter delay through the same one-at-a-time queue
+        delayDirty = false;
+        await cfgChar.writeValueWithResponse(new Uint8Array([typeDelay()]));
+      }
       flushMotion();
       if (!queue.length) break;
       const chunk = queue.splice(0, MAX_WRITE);
@@ -583,6 +592,25 @@ $("raw").onchange = (e) => {
   resetField(); kbd.focus();
 };
 
+// ---------------- letter delay ----------------
+// Pause the Flipper makes after each typed letter. Higher = slower typing,
+// for apps or PCs that drop letters. Remembered on this phone.
+let delayDirty = false;
+function typeDelay() { return Math.max(0, Math.min(100, Math.round(+$("typeDelay").value))); }
+// Rough time the Flipper needs per letter (~4 ms of USB key press/release + the delay)
+function msPerLetter() { return (cfgChar ? typeDelay() : 2) + 4; }
+(function () {
+  const el = $("typeDelay"), out = $("typeDelayVal");
+  try { const v = localStorage.getItem("phonekb.typeDelay"); if (v !== null) el.value = v; } catch (e) {}
+  const show = () => { out.textContent = typeDelay() + " ms"; };
+  show();
+  el.addEventListener("input", () => {
+    show();
+    try { localStorage.setItem("phonekb.typeDelay", String(typeDelay())); } catch (e) {}
+    delayDirty = true; pump();
+  });
+})();
+
 // ---------------- bulk text ----------------
 let bulkCancel = false;
 $("sendBulk").onclick = async () => {
@@ -591,7 +619,7 @@ $("sendBulk").onclick = async () => {
   for (let i = 0; i < text.length && !bulkCancel; i += 100) {
     typeText(text.slice(i, i + 100));
     setStatus(`Typing ${Math.min(i + 100, text.length)}/${text.length}…`, connected);
-    await sleep(100 * 6); // Flipper types roughly 150-250 chars/sec over USB
+    await sleep(100 * msPerLetter()); // don't send faster than the Flipper types (its buffer is 2 KB)
   }
   if (connected) setStatus("Connected: " + device.name, true);
 };
@@ -803,7 +831,7 @@ async function runStep(s) {
       const t = toAscii(s.s || "");
       for (let i = 0; i < t.length && !stopFlag; i += 100) {
         const part = t.slice(i, i + 100);
-        typeText(part); await waitIdle(); await wait(part.length * 6 + 30);  // let the Flipper finish typing
+        typeText(part); await waitIdle(); await wait(part.length * msPerLetter() + 30);  // let the Flipper finish typing
       }
       break;
     }

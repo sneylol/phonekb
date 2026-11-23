@@ -44,6 +44,7 @@ typedef enum {
     PhoneKbCharRx = 0,
     PhoneKbCharAuth,
     PhoneKbCharStatus,
+    PhoneKbCharConfig,
     PhoneKbCharCount,
 } PhoneKbCharId;
 
@@ -80,6 +81,16 @@ static const BleGattCharacteristicParams phone_kb_chars[PhoneKbCharCount] = {
          .security_permissions = ATTR_PERMISSION_NONE,
          .gatt_evt_mask = GATT_DONT_NOTIFY_EVENTS,
          .is_variable = CHAR_VALUE_LEN_CONSTANT},
+    [PhoneKbCharConfig] =
+        {.name = "Config",
+         .data_prop_type = FlipperGattCharacteristicDataFixed,
+         .data.fixed.length = 8,
+         .uuid.Char_UUID_128 = PHONE_KB_CHAR_UUID(0x67),
+         .uuid_type = UUID_TYPE_128,
+         .char_properties = CHAR_PROP_WRITE,
+         .security_permissions = ATTR_PERMISSION_NONE,
+         .gatt_evt_mask = GATT_NOTIFY_ATTRIBUTE_WRITE,
+         .is_variable = CHAR_VALUE_LEN_VARIABLE},
 };
 
 typedef struct {
@@ -93,6 +104,8 @@ typedef struct {
 
     volatile PhoneKbAuthStatus auth; // set in the BLE thread
     PhoneKbAuthStatus published; // value last written to the STATUS characteristic
+    volatile uint8_t letter_delay_ms;
+    volatile bool link_up;
     PhoneKbRxCallback rx_callback;
     PhoneKbAuthCallback auth_callback;
     void* context;
@@ -116,12 +129,15 @@ static BleEventAckStatus phone_kb_event_handler(void* event, void* context) {
     // Not acked: GAP still needs to see these events.
     if(event_pckt->evt == HCI_DISCONNECTION_COMPLETE_EVT_CODE) {
         p->auth = PhoneKbAuthWaiting;
+        p->link_up = false;
         return BleEventNotAck;
     }
     if(event_pckt->evt == HCI_LE_META_EVT_CODE &&
        (event_pckt->data[0] == HCI_LE_CONNECTION_COMPLETE_SUBEVT_CODE ||
         event_pckt->data[0] == HCI_LE_ENHANCED_CONNECTION_COMPLETE_SUBEVT_CODE)) {
         p->auth = PhoneKbAuthWaiting;
+        // data[1] is the HCI status: 0 = the connection really came up
+        p->link_up = (event_pckt->data[1] == 0);
         return BleEventNotAck;
     }
 
@@ -149,6 +165,13 @@ static BleEventAckStatus phone_kb_event_handler(void* event, void* context) {
         return BleEventAckFlowEnable;
     }
 
+    if(mod->Attr_Handle == p->chars[PhoneKbCharConfig].handle + 1) {
+        if(p->auth == PhoneKbAuthOk && mod->Attr_Data_Length >= 1) {
+            p->letter_delay_ms = mod->Attr_Data[0];
+        }
+        return BleEventAckFlowEnable;
+    }
+
     return BleEventNotAck;
 }
 
@@ -161,11 +184,12 @@ static FuriHalBleProfileBase* ble_profile_phone_kb_start(FuriHalBleProfileParams
 
     p->event_handler = ble_event_dispatcher_register_svc_handler(phone_kb_event_handler, p);
     furi_check(ble_gatt_service_add(
-        UUID_TYPE_128, &phone_kb_service_uuid, PRIMARY_SERVICE, 10, &p->svc_handle));
+        UUID_TYPE_128, &phone_kb_service_uuid, PRIMARY_SERVICE, 12, &p->svc_handle));
     for(uint8_t i = 0; i < PhoneKbCharCount; i++) {
         ble_gatt_characteristic_init(p->svc_handle, &phone_kb_chars[i], &p->chars[i]);
     }
     p->auth = PhoneKbAuthWaiting;
+    p->letter_delay_ms = PHONE_KB_DEFAULT_LETTER_DELAY_MS;
     phone_kb_publish_auth(p, PhoneKbAuthWaiting);
     return &p->base;
 }
@@ -267,4 +291,14 @@ PhoneKbAuthStatus ble_profile_phone_kb_sync_status(FuriHalBleProfileBase* profil
 PhoneKbAuthStatus ble_profile_phone_kb_get_auth(FuriHalBleProfileBase* profile) {
     furi_check(profile && (profile->config == ble_profile_phone_kb));
     return ((BleProfilePhoneKb*)profile)->auth;
+}
+
+uint8_t ble_profile_phone_kb_get_letter_delay(FuriHalBleProfileBase* profile) {
+    furi_check(profile && (profile->config == ble_profile_phone_kb));
+    return ((BleProfilePhoneKb*)profile)->letter_delay_ms;
+}
+
+bool ble_profile_phone_kb_is_connected(FuriHalBleProfileBase* profile) {
+    furi_check(profile && (profile->config == ble_profile_phone_kb));
+    return ((BleProfilePhoneKb*)profile)->link_up;
 }

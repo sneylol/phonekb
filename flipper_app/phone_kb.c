@@ -43,7 +43,6 @@
 #define EVENT_LOG_MAX    (16 * 1024)
 #define RX_BUF_SIZE      2048
 #define CHUNK_SIZE       128
-#define TYPE_KEY_DELAY_MS 2
 
 typedef enum {
     OpTap = 0x01,
@@ -172,15 +171,15 @@ static void token_forget(PhoneKb* app) {
     furi_record_close(RECORD_STORAGE);
 }
 
-static void phone_kb_bt_status_cb(BtStatus status, void* context) {
-    PhoneKb* app = context;
-    bool connected = (status == BtStatusConnected);
+// Called from the app thread when the phone link comes up or goes down.
+static void phone_kb_link_changed(PhoneKb* app, bool connected) {
     app->ble_connected = connected;
     if(connected) {
         app->rejected = false;
         notification_internal_message(app->notifications, &sequence_set_blue_255);
     } else {
         notification_internal_message(app->notifications, &sequence_reset_blue);
+        // Don't leave keys or buttons stuck down on the PC
         furi_hal_hid_kb_release_all();
         furi_hal_hid_mouse_release(HID_MOUSE_BTN_LEFT);
         furi_hal_hid_mouse_release(HID_MOUSE_BTN_RIGHT);
@@ -205,7 +204,9 @@ static void type_char(PhoneKb* app, uint8_t c) {
     if(key == HID_KEYBOARD_NONE) return;
     furi_hal_hid_kb_press(key);
     furi_hal_hid_kb_release(key);
-    furi_delay_ms(TYPE_KEY_DELAY_MS);
+    // Pause between letters; set from the phone's "Letter delay" slider
+    uint8_t delay = ble_profile_phone_kb_get_letter_delay(app->profile);
+    if(delay) furi_delay_ms(delay);
     app->keys_sent++;
 }
 
@@ -371,7 +372,6 @@ int32_t phone_kb_app(void* p) {
     furi_check(app->profile);
     ble_profile_phone_kb_set_callbacks(app->profile, phone_kb_rx_cb, phone_kb_auth_cb, app);
     furi_hal_bt_start_advertising();
-    bt_set_status_changed_callback(app->bt, phone_kb_bt_status_cb, app);
 
     uint8_t chunk[CHUNK_SIZE];
     bool running = true;
@@ -403,9 +403,10 @@ int32_t phone_kb_app(void* p) {
             view_port_update(app->view_port);
         }
 
-        bool ble_connected = app->ble_connected;
+        bool ble_connected = ble_profile_phone_kb_is_connected(app->profile);
         if(ble_connected != shown_connected) {
             shown_connected = ble_connected;
+            phone_kb_link_changed(app, ble_connected);
             event_log("phone %s", ble_connected ? "connected" : "disconnected");
         }
 
@@ -441,7 +442,6 @@ int32_t phone_kb_app(void* p) {
     event_log("exit");
 
     // Teardown: restore everything the way we found it
-    bt_set_status_changed_callback(app->bt, NULL, NULL);
     bt_disconnect(app->bt);
     furi_delay_ms(200);
     bt_keys_storage_set_default_path(app->bt);
