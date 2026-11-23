@@ -104,7 +104,8 @@ typedef struct {
 
     volatile PhoneKbAuthStatus auth; // set in the BLE thread
     PhoneKbAuthStatus published; // value last written to the STATUS characteristic
-    volatile uint8_t letter_delay_ms;
+    volatile uint16_t letter_delay_ms;
+    volatile uint32_t stop_count;
     volatile bool link_up;
     PhoneKbRxCallback rx_callback;
     PhoneKbAuthCallback auth_callback;
@@ -167,7 +168,10 @@ static BleEventAckStatus phone_kb_event_handler(void* event, void* context) {
 
     if(mod->Attr_Handle == p->chars[PhoneKbCharConfig].handle + 1) {
         if(p->auth == PhoneKbAuthOk && mod->Attr_Data_Length >= 1) {
-            p->letter_delay_ms = mod->Attr_Data[0];
+            uint16_t ms = mod->Attr_Data[0];
+            if(mod->Attr_Data_Length >= 2) ms |= (uint16_t)mod->Attr_Data[1] << 8;
+            p->letter_delay_ms = ms;
+            if(mod->Attr_Data_Length >= 3 && (mod->Attr_Data[2] & 1)) p->stop_count++;
         }
         return BleEventAckFlowEnable;
     }
@@ -293,9 +297,14 @@ PhoneKbAuthStatus ble_profile_phone_kb_get_auth(FuriHalBleProfileBase* profile) 
     return ((BleProfilePhoneKb*)profile)->auth;
 }
 
-uint8_t ble_profile_phone_kb_get_letter_delay(FuriHalBleProfileBase* profile) {
+uint16_t ble_profile_phone_kb_get_letter_delay(FuriHalBleProfileBase* profile) {
     furi_check(profile && (profile->config == ble_profile_phone_kb));
     return ((BleProfilePhoneKb*)profile)->letter_delay_ms;
+}
+
+uint32_t ble_profile_phone_kb_get_stop_count(FuriHalBleProfileBase* profile) {
+    furi_check(profile && (profile->config == ble_profile_phone_kb));
+    return ((BleProfilePhoneKb*)profile)->stop_count;
 }
 
 bool ble_profile_phone_kb_is_connected(FuriHalBleProfileBase* profile) {

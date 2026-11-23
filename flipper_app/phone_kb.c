@@ -75,6 +75,12 @@ typedef struct {
     volatile bool token_save_pending;
     volatile bool rejected; // last phone sent the wrong secret
     volatile uint32_t rx_dropped; // bytes lost because the buffer was full
+
+    // Typing can take minutes with a long letter delay, so it must be stoppable
+    uint32_t stop_seen; // last stop request handled (see ble_profile_phone_kb_get_stop_count)
+    bool typing_aborted; // drop the rest of what's queued
+    bool exit_requested; // Back pressed while typing
+    bool forget_requested; // Hold Left pressed while typing
     uint32_t keys_sent;
     char last_text[22];
 
@@ -190,7 +196,43 @@ static void phone_kb_link_changed(PhoneKb* app, bool connected) {
 
 // ---------------------------------------------------------------- HID side
 
-static void type_char(PhoneKb* app, uint8_t c) {
+// Checked between letters (and every 10 ms of a letter pause): stop typing when
+// the phone taps Stop, the phone disconnects, or Back is pressed on the Flipper.
+static bool typing_should_stop(PhoneKb* app) {
+    uint32_t stops = ble_profile_phone_kb_get_stop_count(app->profile);
+    if(stops != app->stop_seen) {
+        app->stop_seen = stops;
+        return true;
+    }
+    if(!ble_profile_phone_kb_is_connected(app->profile)) return true;
+    InputEvent ev;
+    while(furi_message_queue_get(app->input_queue, &ev, 0) == FuriStatusOk) {
+        if(ev.key == InputKeyBack && ev.type == InputTypeShort) {
+            app->exit_requested = true;
+            return true;
+        } else if(ev.key == InputKeyLeft && ev.type == InputTypeLong) {
+            app->forget_requested = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Pause after a letter in 10 ms steps. Returns false if typing should stop.
+static bool letter_pause(PhoneKb* app) {
+    uint32_t left = ble_profile_phone_kb_get_letter_delay(app->profile);
+    while(left > 0) {
+        uint32_t step = left < 10 ? left : 10;
+        furi_delay_ms(step);
+        left -= step;
+        if(typing_should_stop(app)) return false;
+    }
+    return true;
+}
+
+// Returns false if typing should stop.
+static bool type_char(PhoneKb* app, uint8_t c) {
+    if(typing_should_stop(app)) return false;
     uint16_t key;
     if(c == '\n' || c == '\r') {
         key = HID_KEYBOARD_RETURN;
@@ -201,13 +243,12 @@ static void type_char(PhoneKb* app, uint8_t c) {
     } else {
         key = HID_ASCII_TO_KEY(c);
     }
-    if(key == HID_KEYBOARD_NONE) return;
+    if(key == HID_KEYBOARD_NONE) return true;
     furi_hal_hid_kb_press(key);
     furi_hal_hid_kb_release(key);
-    // Pause between letters; set from the phone's "Letter delay" slider
-    uint8_t delay = ble_profile_phone_kb_get_letter_delay(app->profile);
-    if(delay) furi_delay_ms(delay);
     app->keys_sent++;
+    // Pause between letters; set from the phone's "Letter delay" slider
+    return letter_pause(app);
 }
 
 static void remember_text(PhoneKb* app, const uint8_t* s, uint8_t len) {
@@ -284,14 +325,35 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
         furi_hal_hid_consumer_key_release(key);
         break;
     }
-    case OpText:
-        for(uint8_t i = 0; i < p[1]; i++) type_char(app, p[2 + i]);
-        remember_text(app, &p[2], p[1]);
+    case OpText: {
+        uint8_t typed = 0;
+        while(typed < p[1]) {
+            if(!type_char(app, p[2 + typed++])) {
+                app->typing_aborted = true;
+                break;
+            }
+        }
+        remember_text(app, &p[2], typed);
         view_port_update(app->view_port);
         break;
+    }
     default:
         break;
     }
+}
+
+// Throw away everything still queued from the phone (after Stop, a disconnect or Back)
+static void clear_queue(PhoneKb* app) {
+    app->pkt_len = 0;
+    uint8_t junk[64];
+    while(furi_stream_buffer_receive(app->rx, junk, sizeof(junk), 0) > 0) {
+    }
+    furi_hal_hid_kb_release_all();
+    furi_hal_hid_consumer_key_release_all();
+    furi_hal_hid_mouse_release(HID_MOUSE_BTN_LEFT);
+    furi_hal_hid_mouse_release(HID_MOUSE_BTN_RIGHT);
+    furi_hal_hid_mouse_release(HID_MOUSE_BTN_WHEEL);
+    event_log("typing stopped, queue cleared");
 }
 
 static void process_bytes(PhoneKb* app, const uint8_t* data, size_t len) {
@@ -301,7 +363,12 @@ static void process_bytes(PhoneKb* app, const uint8_t* data, size_t len) {
         if(app->pkt_len >= need) {
             execute_packet(app, app->pkt);
             app->pkt_len = 0;
+            if(app->typing_aborted) break;
         }
+    }
+    if(app->typing_aborted) {
+        app->typing_aborted = false;
+        clear_queue(app);
     }
 }
 
@@ -383,6 +450,13 @@ int32_t phone_kb_app(void* p) {
         size_t n = furi_stream_buffer_receive(app->rx, chunk, sizeof(chunk), 30);
         if(n > 0) process_bytes(app, chunk, n);
 
+        // Stop tapped on the phone while nothing was being typed: drop what's queued
+        uint32_t stops = ble_profile_phone_kb_get_stop_count(app->profile);
+        if(stops != app->stop_seen) {
+            app->stop_seen = stops;
+            clear_queue(app);
+        }
+
         if(app->token_save_pending) {
             app->token_save_pending = false;
             token_save(app);
@@ -423,19 +497,22 @@ int32_t phone_kb_app(void* p) {
         }
 
         InputEvent ev;
+        if(app->exit_requested) running = false;
+        bool forget = app->forget_requested;
+        app->forget_requested = false;
         while(furi_message_queue_get(app->input_queue, &ev, 0) == FuriStatusOk) {
-            if(ev.key == InputKeyBack && ev.type == InputTypeShort) {
-                running = false;
-            } else if(ev.key == InputKeyLeft && ev.type == InputTypeLong) {
-                // Forget the linked phone: the next phone that connects becomes the new one
-                token_forget(app);
-                event_log("hold left: linked phone forgotten");
-                bt_disconnect(app->bt);
-                furi_delay_ms(200);
-                furi_hal_bt_start_advertising();
-                notification_message(app->notifications, &sequence_success);
-                view_port_update(app->view_port);
-            }
+            if(ev.key == InputKeyBack && ev.type == InputTypeShort) running = false;
+            if(ev.key == InputKeyLeft && ev.type == InputTypeLong) forget = true;
+        }
+        if(forget) {
+            // Forget the linked phone: the next phone that connects becomes the new one
+            token_forget(app);
+            event_log("hold left: linked phone forgotten");
+            bt_disconnect(app->bt);
+            furi_delay_ms(200);
+            furi_hal_bt_start_advertising();
+            notification_message(app->notifications, &sequence_success);
+            view_port_update(app->view_port);
         }
     }
 

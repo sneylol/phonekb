@@ -268,7 +268,7 @@
   </div>
   <div class="settings">
     <label>Scroll <input id="scrollSpeed" type="range" min="0.2" max="3" step="0.1" value="1"></label>
-    <label>Letter delay <input id="typeDelay" type="range" min="0" max="100" step="1" value="2"> <output id="typeDelayVal">2 ms</output></label>
+    <label>Letter delay <input id="typeDelay" type="range" min="0" max="31" step="1" value="2"> <output id="typeDelayVal">2 ms</output></label>
     <label><input id="raw" type="checkbox"> No autocorrect</label>
   </div>
 </div>
@@ -287,7 +287,7 @@ const RX_CHAR = "19ed82ae-ed21-4c9d-4145-228e62fe0000"; // phone -> Flipper
 // No-PIN Flipper app: the page proves itself with a saved random secret instead of Bluetooth pairing
 const AUTH_CHAR = "19ed82ae-ed21-4c9d-4145-228e65fe0000";   // write 16-byte secret
 const STATUS_CHAR = "19ed82ae-ed21-4c9d-4145-228e66fe0000"; // read: 0 waiting, 1 ok, 2 rejected
-const CONFIG_CHAR = "19ed82ae-ed21-4c9d-4145-228e67fe0000"; // write: [0] = ms pause after each typed letter
+const CONFIG_CHAR = "19ed82ae-ed21-4c9d-4145-228e67fe0000"; // write: [0..1] = ms pause after each typed letter, [2] bit 0 = stop typing
 
 // Random secret for this browser, created once and kept in localStorage.
 // The Flipper remembers the first secret it receives (hold Left on the Flipper to reset).
@@ -389,7 +389,7 @@ async function openGattOnce() {
     if (st !== 1) throw new Error("The Flipper didn't answer the key check");
     // Letter delay setting (older Flipper builds don't have it: then typing speed is fixed)
     try { cfgChar = await svc.getCharacteristic(CONFIG_CHAR); } catch (_) { cfgChar = null; }
-    delayDirty = true;
+    delayDirty = true; stopPending = false;   // a Stop tapped while offline must not hit the next text
   } else {
     // First write needs an encrypted, bonded link. Android shows its pairing
     // dialog here: type the 6-digit PIN that appears on the Flipper's screen.
@@ -462,9 +462,10 @@ async function pump() {
   pumping = true;
   try {
     for (;;) {
-      if (delayDirty && cfgChar) {   // send the letter delay through the same one-at-a-time queue
-        delayDirty = false;
-        await cfgChar.writeValueWithResponse(new Uint8Array([typeDelay()]));
+      if ((delayDirty || stopPending) && cfgChar) {   // settings go through the same one-at-a-time queue
+        const d = typeDelay(), stop = stopPending ? 1 : 0;
+        delayDirty = false; stopPending = false;
+        await cfgChar.writeValueWithResponse(new Uint8Array([d & 0xFF, d >> 8, stop]));
       }
       flushMotion();
       if (!queue.length) break;
@@ -595,14 +596,26 @@ $("raw").onchange = (e) => {
 // ---------------- letter delay ----------------
 // Pause the Flipper makes after each typed letter. Higher = slower typing,
 // for apps or PCs that drop letters. Remembered on this phone.
-let delayDirty = false;
-function typeDelay() { return Math.max(0, Math.min(100, Math.round(+$("typeDelay").value))); }
+let delayDirty = false, stopPending = false;
+// Slider positions -> ms (fine steps at the fast end, big steps at the slow end)
+const DELAY_STEPS = [0, 1, 2, 3, 5, 8, 10, 15, 20, 25, 30, 40, 50, 60, 75, 100, 125, 150, 200, 250,
+                     300, 400, 500, 600, 750, 1000, 1250, 1500, 2000, 3000, 4000, 5000];
+function typeDelay() { return DELAY_STEPS[Math.max(0, Math.min(DELAY_STEPS.length - 1, Math.round(+$("typeDelay").value)))]; }
 // Rough time the Flipper needs per letter (~4 ms of USB key press/release + the delay)
 function msPerLetter() { return (cfgChar ? typeDelay() : 2) + 4; }
+// Tell the Flipper to stop typing and drop whatever it still has queued
+function stopTyping() { queue = []; stopPending = true; pump(); }
 (function () {
   const el = $("typeDelay"), out = $("typeDelayVal");
-  try { const v = localStorage.getItem("phonekb.typeDelay"); if (v !== null) el.value = v; } catch (e) {}
-  const show = () => { out.textContent = typeDelay() + " ms"; };
+  try {
+    const v = localStorage.getItem("phonekb.typeDelay");   // saved in ms
+    if (v !== null) {
+      let best = 0;
+      DELAY_STEPS.forEach((ms, i) => { if (Math.abs(ms - +v) < Math.abs(DELAY_STEPS[best] - +v)) best = i; });
+      el.value = best;
+    }
+  } catch (e) {}
+  const show = () => { const d = typeDelay(); out.textContent = d >= 1000 ? (d / 1000) + " s" : d + " ms"; };
   show();
   el.addEventListener("input", () => {
     show();
@@ -619,11 +632,13 @@ $("sendBulk").onclick = async () => {
   for (let i = 0; i < text.length && !bulkCancel; i += 100) {
     typeText(text.slice(i, i + 100));
     setStatus(`Typing ${Math.min(i + 100, text.length)}/${text.length}…`, connected);
-    await sleep(100 * msPerLetter()); // don't send faster than the Flipper types (its buffer is 2 KB)
+    // don't send faster than the Flipper types (its buffer is 2 KB); wake up early on Stop
+    const until = performance.now() + 100 * msPerLetter();
+    while (!bulkCancel && performance.now() < until) await sleep(50);
   }
   if (connected) setStatus("Connected: " + device.name, true);
 };
-$("stopBulk").onclick = () => { bulkCancel = true; queue = []; send(OP.RELEASE); };
+$("stopBulk").onclick = () => { bulkCancel = true; stopTyping(); send(OP.RELEASE); };
 
 // ---------------- mouse buttons ----------------
 document.querySelectorAll("button[data-mouse]").forEach((b) => {
@@ -880,7 +895,7 @@ async function playMacro(name, reps = 1, mark = false) {
   }
 }
 function play() { return playMacro(curName, Math.max(1, Math.min(999, +$("mrep").value || 1)), true); }
-function stopPlay() { stopFlag = true; queue = []; }
+function stopPlay() { stopFlag = true; stopTyping(); }
 function markStep(i) { document.querySelectorAll(".step").forEach((el, j) => el.classList.toggle("cur", j === i)); }
 
 // ---- editor ----

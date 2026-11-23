@@ -19,7 +19,9 @@ extern "C" {
  *   RX     19ed82ae-ed21-4c9d-4145-228e62fe0000  write          command bytes
  *   AUTH   19ed82ae-ed21-4c9d-4145-228e65fe0000  write          16-byte secret
  *   STATUS 19ed82ae-ed21-4c9d-4145-228e66fe0000  read           0 waiting, 1 ok, 2 rejected
- *   CONFIG 19ed82ae-ed21-4c9d-4145-228e67fe0000  write          [0] = ms to wait after each typed letter
+ *   CONFIG 19ed82ae-ed21-4c9d-4145-228e67fe0000  write          [0..1] = ms to wait after each typed
+ *                                                                letter (little-endian; 1 byte also ok),
+ *                                                                [2] bit 0 = stop typing what's queued
  */
 extern const FuriHalBleProfileTemplate* const ble_profile_phone_kb;
 
@@ -61,7 +63,10 @@ PhoneKbAuthStatus ble_profile_phone_kb_get_auth(FuriHalBleProfileBase* profile);
 bool ble_profile_phone_kb_is_connected(FuriHalBleProfileBase* profile);
 
 /** Pause after each letter of typed text, as last set by the phone (CONFIG). */
-uint8_t ble_profile_phone_kb_get_letter_delay(FuriHalBleProfileBase* profile);
+uint16_t ble_profile_phone_kb_get_letter_delay(FuriHalBleProfileBase* profile);
+
+/** Increments each time the phone asks to stop typing (CONFIG [2] bit 0). */
+uint32_t ble_profile_phone_kb_get_stop_count(FuriHalBleProfileBase* profile);
 
 #ifdef __cplusplus
 }
