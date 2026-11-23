@@ -11,8 +11,6 @@
 #include <services/dev_info_service.h>
 #include <services/battery_service.h>
 
-#define TAG "PhoneKbProfile"
-
 // The SDK doesn't ship the HCI transport headers, so mirror the few
 // definitions the GATT event handler needs (same layout as ST's hci_tl.h).
 typedef struct __attribute__((packed)) {
@@ -93,22 +91,40 @@ typedef struct {
     BleGattCharacteristicInstance chars[PhoneKbCharCount];
     GapSvcEventHandler* event_handler;
 
-    volatile PhoneKbAuthStatus auth;
+    volatile PhoneKbAuthStatus auth; // set in the BLE thread
+    PhoneKbAuthStatus published; // value last written to the STATUS characteristic
     PhoneKbRxCallback rx_callback;
     PhoneKbAuthCallback auth_callback;
     void* context;
 } BleProfilePhoneKb;
 _Static_assert(offsetof(BleProfilePhoneKb, base) == 0, "Wrong layout");
 
-static void phone_kb_set_auth(BleProfilePhoneKb* p, PhoneKbAuthStatus status) {
-    p->auth = status;
+static void phone_kb_publish_auth(BleProfilePhoneKb* p, PhoneKbAuthStatus status) {
+    p->published = status;
     uint8_t value = (uint8_t)status;
     ble_gatt_characteristic_update(p->svc_handle, &p->chars[PhoneKbCharStatus], &value);
 }
 
+// Runs in the "BleEventWorker" thread, which has a tiny stack (~1.3 KB):
+// no logging, no BLE commands, nothing that blocks. Only flip flags and copy bytes.
 static BleEventAckStatus phone_kb_event_handler(void* event, void* context) {
     BleProfilePhoneKb* p = context;
     PhoneKbHciEventPckt* event_pckt = (PhoneKbHciEventPckt*)(((PhoneKbHciUartPckt*)event)->data);
+
+    // A new or dropped link must present the secret again. Done here, in the
+    // same thread that handles AUTH writes, so it can never land after them.
+    // Not acked: GAP still needs to see these events.
+    if(event_pckt->evt == HCI_DISCONNECTION_COMPLETE_EVT_CODE) {
+        p->auth = PhoneKbAuthWaiting;
+        return BleEventNotAck;
+    }
+    if(event_pckt->evt == HCI_LE_META_EVT_CODE &&
+       (event_pckt->data[0] == HCI_LE_CONNECTION_COMPLETE_SUBEVT_CODE ||
+        event_pckt->data[0] == HCI_LE_ENHANCED_CONNECTION_COMPLETE_SUBEVT_CODE)) {
+        p->auth = PhoneKbAuthWaiting;
+        return BleEventNotAck;
+    }
+
     if(event_pckt->evt != HCI_VENDOR_SPECIFIC_DEBUG_EVT_CODE) return BleEventNotAck;
     PhoneKbEvtBlecoreAci* blecore_evt = (PhoneKbEvtBlecoreAci*)event_pckt->data;
     if(blecore_evt->ecode != PHONE_KB_ACI_GATT_ATTRIBUTE_MODIFIED_VSEVT_CODE) return BleEventNotAck;
@@ -129,8 +145,7 @@ static BleEventAckStatus phone_kb_event_handler(void* event, void* context) {
         if(mod->Attr_Data_Length == PHONE_KB_TOKEN_LEN && p->auth_callback) {
             ok = p->auth_callback(mod->Attr_Data, p->context);
         }
-        FURI_LOG_I(TAG, "Auth %s", ok ? "accepted" : "rejected");
-        phone_kb_set_auth(p, ok ? PhoneKbAuthOk : PhoneKbAuthRejected);
+        p->auth = ok ? PhoneKbAuthOk : PhoneKbAuthRejected;
         return BleEventAckFlowEnable;
     }
 
@@ -150,7 +165,8 @@ static FuriHalBleProfileBase* ble_profile_phone_kb_start(FuriHalBleProfileParams
     for(uint8_t i = 0; i < PhoneKbCharCount; i++) {
         ble_gatt_characteristic_init(p->svc_handle, &phone_kb_chars[i], &p->chars[i]);
     }
-    phone_kb_set_auth(p, PhoneKbAuthWaiting);
+    p->auth = PhoneKbAuthWaiting;
+    phone_kb_publish_auth(p, PhoneKbAuthWaiting);
     return &p->base;
 }
 
@@ -240,9 +256,12 @@ void ble_profile_phone_kb_set_callbacks(
     p->auth_callback = auth_callback;
 }
 
-void ble_profile_phone_kb_reset_auth(FuriHalBleProfileBase* profile) {
+PhoneKbAuthStatus ble_profile_phone_kb_sync_status(FuriHalBleProfileBase* profile) {
     furi_check(profile && (profile->config == ble_profile_phone_kb));
-    phone_kb_set_auth((BleProfilePhoneKb*)profile, PhoneKbAuthWaiting);
+    BleProfilePhoneKb* p = (BleProfilePhoneKb*)profile;
+    PhoneKbAuthStatus now = p->auth;
+    if(now != p->published) phone_kb_publish_auth(p, now);
+    return now;
 }
 
 PhoneKbAuthStatus ble_profile_phone_kb_get_auth(FuriHalBleProfileBase* profile) {

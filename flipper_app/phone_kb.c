@@ -23,6 +23,7 @@
  *   0x0A mods key        key up
  */
 
+#include <stdarg.h>
 #include <furi.h>
 #include <furi_hal_bt.h>
 #include <furi_hal_usb.h>
@@ -38,6 +39,8 @@
 #define TAG              "PhoneKB"
 #define KEYS_PATH        APP_DATA_PATH(".phone_kb.keys")
 #define TOKEN_PATH       APP_DATA_PATH(".phone_kb.token")
+#define EVENT_LOG_PATH   APP_DATA_PATH("events.log")
+#define EVENT_LOG_MAX    (16 * 1024)
 #define RX_BUF_SIZE      2048
 #define CHUNK_SIZE       128
 #define TYPE_KEY_DELAY_MS 2
@@ -72,6 +75,7 @@ typedef struct {
     volatile bool has_token;
     volatile bool token_save_pending;
     volatile bool rejected; // last phone sent the wrong secret
+    volatile uint32_t rx_dropped; // bytes lost because the buffer was full
     uint32_t keys_sent;
     char last_text[22];
 
@@ -82,15 +86,46 @@ typedef struct {
 
 // ---------------------------------------------------------------- BLE side
 
-// Runs in the BLE/GAP thread: only copy bytes, never block on USB here.
+// Small text log on the SD card (apps_data/<app>/events.log), written only from
+// the app thread. While the app runs, USB is a keyboard, so there's no console:
+// this is how a freeze or a refused phone can be diagnosed afterwards.
+static void event_log(const char* fmt, ...) {
+    char line[96];
+    int n = snprintf(line, sizeof(line), "%lu ", (unsigned long)furi_get_tick());
+    va_list args;
+    va_start(args, fmt);
+    n += vsnprintf(line + n, sizeof(line) - n - 1, fmt, args);
+    va_end(args);
+    if(n > (int)sizeof(line) - 2) n = sizeof(line) - 2;
+    line[n++] = '\n';
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file = storage_file_alloc(storage);
+    if(storage_file_open(file, EVENT_LOG_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
+        storage_file_write(file, line, n);
+    }
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+}
+
+static void event_log_start(void) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    FileInfo info;
+    if(storage_common_stat(storage, EVENT_LOG_PATH, &info) == FSE_OK && info.size > EVENT_LOG_MAX) {
+        storage_simply_remove(storage, EVENT_LOG_PATH);
+    }
+    furi_record_close(RECORD_STORAGE);
+}
+
+// Runs in the BLE event thread (tiny stack): only copy bytes, no logging, never block.
 static void phone_kb_rx_cb(const uint8_t* data, uint16_t size, void* context) {
     PhoneKb* app = context;
     size_t sent = furi_stream_buffer_send(app->rx, data, size, 0);
-    if(sent != size) FURI_LOG_W(TAG, "RX overflow, dropped %u", size - sent);
+    if(sent != size) app->rx_dropped += size - sent;
 }
 
-// Runs in the BLE/GAP thread. First secret ever seen is adopted (saved later
-// by the main loop); after that it must match.
+// Runs in the BLE event thread (tiny stack). First secret ever seen is adopted
+// (saved later by the main loop); after that it must match.
 static bool phone_kb_auth_cb(const uint8_t token[PHONE_KB_TOKEN_LEN], void* context) {
     PhoneKb* app = context;
     bool ok;
@@ -141,8 +176,6 @@ static void phone_kb_bt_status_cb(BtStatus status, void* context) {
     PhoneKb* app = context;
     bool connected = (status == BtStatusConnected);
     app->ble_connected = connected;
-    // Every new link has to present the secret again
-    ble_profile_phone_kb_reset_auth(app->profile);
     if(connected) {
         app->rejected = false;
         notification_internal_message(app->notifications, &sequence_set_blue_255);
@@ -326,6 +359,8 @@ int32_t phone_kb_app(void* p) {
     furi_check(furi_hal_usb_set_config(&usb_hid, NULL));
 
     token_load(app);
+    event_log_start();
+    event_log("start, linked phone: %s", app->has_token ? "yes" : "no");
 
     // BLE: swap the system profile for ours
     app->bt = furi_record_open(RECORD_BT);
@@ -341,6 +376,9 @@ int32_t phone_kb_app(void* p) {
     uint8_t chunk[CHUNK_SIZE];
     bool running = true;
     bool usb_was_connected = false;
+    PhoneKbAuthStatus shown_auth = PhoneKbAuthWaiting;
+    bool shown_connected = false;
+    uint32_t logged_dropped = 0;
     while(running) {
         size_t n = furi_stream_buffer_receive(app->rx, chunk, sizeof(chunk), 30);
         if(n > 0) process_bytes(app, chunk, n);
@@ -348,15 +386,33 @@ int32_t phone_kb_app(void* p) {
         if(app->token_save_pending) {
             app->token_save_pending = false;
             token_save(app);
+            event_log("new phone linked, key saved");
             notification_message(app->notifications, &sequence_success);
         }
 
-        // Status line ("checking key" -> "connected"/"wrong key") changes in the BLE thread
-        static PhoneKbAuthStatus shown_auth = PhoneKbAuthWaiting;
-        PhoneKbAuthStatus auth = ble_profile_phone_kb_get_auth(app->profile);
+        // The key check happens in the BLE thread; publish its result to the
+        // phone (STATUS characteristic) and the screen from here.
+        PhoneKbAuthStatus auth = ble_profile_phone_kb_sync_status(app->profile);
         if(auth != shown_auth) {
             shown_auth = auth;
+            event_log(
+                "key %s",
+                auth == PhoneKbAuthOk       ? "accepted" :
+                auth == PhoneKbAuthRejected ? "REJECTED" :
+                                              "reset");
             view_port_update(app->view_port);
+        }
+
+        bool ble_connected = app->ble_connected;
+        if(ble_connected != shown_connected) {
+            shown_connected = ble_connected;
+            event_log("phone %s", ble_connected ? "connected" : "disconnected");
+        }
+
+        uint32_t dropped = app->rx_dropped;
+        if(dropped != logged_dropped) {
+            logged_dropped = dropped;
+            event_log("rx buffer full, %lu bytes dropped so far", (unsigned long)dropped);
         }
 
         bool usb_connected = furi_hal_hid_is_connected();
@@ -372,6 +428,7 @@ int32_t phone_kb_app(void* p) {
             } else if(ev.key == InputKeyLeft && ev.type == InputTypeLong) {
                 // Forget the linked phone: the next phone that connects becomes the new one
                 token_forget(app);
+                event_log("hold left: linked phone forgotten");
                 bt_disconnect(app->bt);
                 furi_delay_ms(200);
                 furi_hal_bt_start_advertising();
@@ -380,6 +437,8 @@ int32_t phone_kb_app(void* p) {
             }
         }
     }
+
+    event_log("exit");
 
     // Teardown: restore everything the way we found it
     bt_set_status_changed_callback(app->bt, NULL, NULL);

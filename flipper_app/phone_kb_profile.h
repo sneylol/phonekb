@@ -30,10 +30,10 @@ typedef enum {
     PhoneKbAuthRejected = 2,
 } PhoneKbAuthStatus;
 
-/** Called in the BLE thread with command bytes from an accepted phone. */
+/** Called in the BLE event thread (tiny stack!) with bytes from an accepted phone. Must not block. */
 typedef void (*PhoneKbRxCallback)(const uint8_t* data, uint16_t size, void* context);
 
-/** Called in the BLE thread with the secret the phone sent. Return true to accept it. */
+/** Called in the BLE event thread (tiny stack!) with the phone's secret. Return true to accept. Must not block. */
 typedef bool (*PhoneKbAuthCallback)(const uint8_t token[PHONE_KB_TOKEN_LEN], void* context);
 
 void ble_profile_phone_kb_set_callbacks(
@@ -42,8 +42,12 @@ void ble_profile_phone_kb_set_callbacks(
     PhoneKbAuthCallback auth_callback,
     void* context);
 
-/** Forget whether the current link is accepted. Call on every connect and disconnect. */
-void ble_profile_phone_kb_reset_auth(FuriHalBleProfileBase* profile);
+/**
+ * Copy the current auth state into the STATUS characteristic the phone reads.
+ * Call often from the app thread (BLE commands are not safe in the BLE event
+ * thread). Returns the current state.
+ */
+PhoneKbAuthStatus ble_profile_phone_kb_sync_status(FuriHalBleProfileBase* profile);
 
 PhoneKbAuthStatus ble_profile_phone_kb_get_auth(FuriHalBleProfileBase* profile);
 

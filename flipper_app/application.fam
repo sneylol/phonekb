@@ -3,7 +3,7 @@ App(
     name="Phone Keyboard",
     apptype=FlipperAppType.EXTERNAL,
     entry_point="phone_kb_app",
-    stack_size=3 * 1024,
+    stack_size=4 * 1024,
     requires=["gui", "bt"],
     fap_category="USB",
     fap_icon="phone_kb_10px.png",
