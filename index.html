@@ -324,17 +324,13 @@ function setStatus(text, ok) {
 function showErr(text) { $("err").textContent = text || ""; const r = document.getElementById("rerr"); if (r) r.textContent = text || ""; }
 
 // ---------------- connection ----------------
+try { localStorage.removeItem("phonekb.auto"); localStorage.removeItem("phonekb.rememberedWorks"); } catch (e) {}   // old auto-connect settings
 async function connect() {
   showErr("");
-  userStopped = false;
-  stopAutoConnect();
   if (!navigator.bluetooth) {
     showErr("Web Bluetooth isn't available. Open this page in Chrome on Android, over https://.");
     return;
   }
-  // A Flipper entry the browser handed back after a reload (getDevices) may not
-  // be connectable (seen in Bluefy). If it hasn't worked yet, pick it again.
-  if (device && deviceSource === "remembered" && !deviceEverConnected) dropDevice();
   try {
     if (!device) {
       device = await navigator.bluetooth.requestDevice({
@@ -342,113 +338,15 @@ async function connect() {
         optionalServices: [SERVICE],
       });
       device.addEventListener("gattserverdisconnected", onDisconnected);
-      deviceSource = "picker"; deviceEverConnected = false;
     }
+    wantConnected = true;
+    freshConnect = true;     // the user tapped Connect: may link an unlinked Flipper
+    await openGatt();
   } catch (e) {
     if (e.name !== "NotFoundError") showErr(String(e.message || e)); // NotFound = user cancelled picker
     setStatus("Not connected", false);
-    return;
-  }
-  wantConnected = true;
-  freshConnect = true;     // the user tapped Connect: may link an unlinked Flipper
-  $("connect").textContent = "Stop";
-  try {
-    await openGatt();
-  } catch (e) {
-    if (userStopped) return;
-    if (/^(Pairing failed|Wrong key)/.test(e.message)) {   // needs the user
-      showErr(e.message); setStatus("Not connected", false); $("connect").textContent = "Connect";
-      return;
-    }
-    // The Flipper app isn't reachable yet: keep looking by itself
-    wantConnected = true;
-    setStatus("Waiting for the Flipper… open Phone Keyboard on it", false);
-    scheduleReconnect(1500);
   }
 }
-
-// ---------------- auto-connect ----------------
-// After you tap Connect once, the page keeps (re)connecting by itself whenever
-// the Phone Keyboard app is reachable: after the Flipper app restarts, the link
-// drops, or the page is reopened. Only Disconnect (or Stop) ends that.
-let reconnectTimer = null, reconnectDelay = 1000, userStopped = false;
-let deviceSource = null;        // "picker" (chosen in the list) or "remembered" (getDevices after a reload)
-let deviceEverConnected = false, rememberedFails = 0;
-function dropDevice() {
-  try { device.removeEventListener("gattserverdisconnected", onDisconnected); } catch (_) {}
-  device = null; deviceSource = null; deviceEverConnected = false;
-}
-function rememberAutoConnect(on) { try { localStorage.setItem("phonekb.auto", on ? "1" : "0"); } catch (e) {} }
-function stopAutoConnect() { clearTimeout(reconnectTimer); reconnectTimer = null; }
-function scheduleReconnect(ms) {
-  stopAutoConnect();
-  if (!wantConnected || userStopped) return;
-  reconnectTimer = setTimeout(tryReconnect, ms);
-  $("connect").textContent = "Stop";
-}
-async function tryReconnect() {
-  reconnectTimer = null;
-  if (!wantConnected || userStopped || connected || connecting || !device) return;
-  setStatus("Looking for the Flipper…", false);
-  try {
-    await openGatt();
-    reconnectDelay = 1000;
-  } catch (e) {
-    if (userStopped) return;
-    if (/^(Pairing failed|Wrong key)/.test(e.message)) {   // needs the user
-      showErr(e.message); setStatus("Not connected", false); $("connect").textContent = "Connect";
-      return;
-    }
-    if (deviceSource === "remembered" && !deviceEverConnected && ++rememberedFails >= 2) {
-      // The browser's remembered entry doesn't connect: stop, and don't try it on the next reload either
-      try { localStorage.setItem("phonekb.rememberedWorks", "0"); } catch (_) {}
-      wantConnected = false;
-      setStatus("Not connected", false); $("connect").textContent = "Connect";
-      showErr("Couldn't reconnect by itself after the page reloaded. Tap Connect and pick the Flipper; after that it reconnects by itself again.");
-      return;
-    }
-    wantConnected = true;     // openGatt gave up; keep looking quietly, a bit slower each time
-    reconnectDelay = Math.min(Math.round(reconnectDelay * 1.5), 5000);
-    setStatus(deviceEverConnected ? "Waiting for the Flipper… is Phone Keyboard open on it?"
-                                  : "Can't reach the Flipper yet, trying again…", false);
-    scheduleReconnect(reconnectDelay);
-  }
-}
-// Coming back to the page: try right away instead of waiting for the timer
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && wantConnected && !userStopped && !connected && !connecting) scheduleReconnect(100);
-});
-// Page opened again: reconnect to the Flipper used last time without the picker,
-// if the browser remembers it (getDevices); otherwise tap Connect once.
-(async function autoStart() {
-  let want = false, works = true;
-  try {
-    want = localStorage.getItem("phonekb.auto") === "1";
-    works = localStorage.getItem("phonekb.rememberedWorks") !== "0";   // failed here before: skip
-  } catch (e) {}
-  if (!want || !works || !navigator.bluetooth || !navigator.bluetooth.getDevices) {
-    if (want) setStatus("Tap Connect to reconnect", false);
-    return;
-  }
-  try {
-    const known = await navigator.bluetooth.getDevices();
-    const d = known.find((x) => (x.name || "").startsWith("PhoneKB"));
-    if (!d || device) { if (!device) setStatus("Tap Connect to reconnect", false); return; }
-    device = d; deviceSource = "remembered"; deviceEverConnected = false; rememberedFails = 0;
-    device.addEventListener("gattserverdisconnected", onDisconnected);
-    wantConnected = true; freshConnect = false; userStopped = false;
-    setStatus("Looking for the Flipper…", false);
-    // Some browsers can only connect to a remembered device after hearing it
-    // advertise: listen briefly first where that's supported.
-    if (d.watchAdvertisements) {
-      try {
-        const heard = new Promise((res) => d.addEventListener("advertisementreceived", res, { once: true }));
-        await Promise.race([(async () => { await d.watchAdvertisements(); await heard; })(), sleep(5000)]);
-      } catch (_) {}
-    }
-    if (device === d && !connected) scheduleReconnect(100);
-  } catch (e) {}
-})();
 
 let connecting = false;
 let freshConnect = false;    // false for automatic reconnects
@@ -523,9 +421,6 @@ async function openGattOnce() {
       await rxChar.writeValueWithResponse(new Uint8Array([OP.RELEASE]));
       if (progressChar) sentBytes += 1;   // the Flipper counts this byte too
       connected = true;
-      deviceEverConnected = true;
-      rememberAutoConnect(true);
-      if (deviceSource === "remembered") { try { localStorage.setItem("phonekb.rememberedWorks", "1"); } catch (_) {} }
       keepAwake(true);
       break;
     } catch (e) {
@@ -547,21 +442,15 @@ function onDisconnected() {
   leftLocked = false; $("lock").classList.remove("on"); $("lock").textContent = "Hold click"; // Flipper releases buttons on disconnect
   setStatus("Disconnected", false);
   $("connect").textContent = "Connect";
-  if (wantConnected && !userStopped) {
+  if (wantConnected) {
     setStatus("Reconnecting…", false);
-    scheduleReconnect(800);
+    setTimeout(() => { if (wantConnected && !connected) openGatt().catch((e) => { setStatus("Not connected", false); showErr(e.message); }); }, 1000);
   }
 }
 
 $("connect").onclick = () => {
-  if (connected || connecting || reconnectTimer) {   // Disconnect / Stop looking
-    userStopped = true; wantConnected = false;
-    rememberAutoConnect(false);
-    stopAutoConnect();
-    try { device.gatt.disconnect(); } catch (_) {}
-    setStatus("Not connected", false);
-    $("connect").textContent = "Connect";
-  }
+  if (connected) { wantConnected = false; device.gatt.disconnect(); }
+  else if (connecting) { wantConnected = false; try { device.gatt.disconnect(); } catch (_) {} setStatus("Cancelled", false); }
   else connect();
 };
 
