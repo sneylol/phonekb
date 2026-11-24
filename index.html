@@ -53,6 +53,7 @@
   textarea { width: 100%; height: 80px; font: inherit; background: var(--panel); color: var(--text);
     border: 1px solid #333843; border-radius: 8px; padding: 8px; }
   .settings:not(.human-on) .humanopt { display: none; }
+  .settings select { background: var(--key); color: var(--text); border: 0; border-radius: 6px; padding: 3px 6px; font-size: 13px; }
   .settings { display: flex; flex-wrap: wrap; gap: 8px 16px; padding: 8px 10px; color: var(--muted); font-size: 13px; align-items: center; }
   .settings input[type=range] { width: 110px; accent-color: var(--key-active); }
   #err { color: var(--bad); padding: 0 12px; font-size: 13px; }
@@ -278,6 +279,8 @@
     <label title="Send text, Clipboard and macros are typed like a person: natural rhythm, pauses, key presses"><input id="human" type="checkbox"> Humanize</label>
     <label class="humanopt">Speed <input id="wpm" type="range" min="15" max="150" step="5" value="55"> <output id="wpmVal">55 WPM</output></label>
     <label class="humanopt" title="Now and then hit a neighbouring key and fix it with Backspace"><input id="typos" type="checkbox"> Typos</label>
+    <label class="humanopt" title="Pause to think every few sentences and before new paragraphs">Thinking
+      <select id="think"><option value="0">Off</option><option value="1">Light</option><option value="2">Normal</option><option value="3">Heavy</option></select></label>
     <label><input id="raw" type="checkbox"> No autocorrect</label>
   </div>
 </div>
@@ -589,9 +592,9 @@ async function pump() {
         delayDirty = false; stopPending = false; releasePending = false;
         try {
           // [3] = PC layout, so the Flipper presses the right keys for y/z, umlauts, symbols
-          // [4] bit 1 = typos, [5] = WPM for humanized text
+          // [4] bit 1 = typos, bits 2-3 = thinking pauses, [5] = WPM for humanized text
           await gatt(() => cfgChar.writeValueWithResponse(new Uint8Array([d & 0xFF, d >> 8, flags, GERMAN_PC ? 1 : 0,
-                                                                          $("typos").checked ? 2 : 0, humanWpm()])));
+                                                                          ($("typos").checked ? 2 : 0) | (thinkLevel() << 2), humanWpm()])));
         } catch (e) {
           delayDirty = true; if (flags & 1) stopPending = true; if (flags & 4) releasePending = true;   // try again
           throw e;
@@ -846,6 +849,7 @@ async function whilePaused(cancelled) { while (paused && !cancelled()) await sle
 // Typing like a person is done on the Flipper (exact timing on USB): the page
 // only sends the speed and whether to make typos, and marks text as "humanized".
 let flipperVersion = 0;
+function thinkLevel() { return Math.max(0, Math.min(3, +$("think").value || 0)); }
 function humanWpm() { return Math.max(15, Math.min(150, Math.round(+$("wpm").value || 55))); }
 function humanOn() { return $("human").checked && flipperVersion >= 2; }
 function humanMsPerLetter() { return 12000 / humanWpm() * 1.1; }   // average incl. pauses
@@ -854,11 +858,12 @@ function checkHumanSupport() {
     showErr("Humanize needs the newer Phone Keyboard app on the Flipper; text is typed normally until then.");
 }
 (function () {
-  const human = $("human"), wpm = $("wpm"), out = $("wpmVal"), typos = $("typos");
+  const human = $("human"), wpm = $("wpm"), out = $("wpmVal"), typos = $("typos"), think = $("think");
   try {
     human.checked = localStorage.getItem("phonekb.human") === "1";
     const w = localStorage.getItem("phonekb.wpm"); if (w) wpm.value = w;
     typos.checked = localStorage.getItem("phonekb.typos") === "1";
+    const th = localStorage.getItem("phonekb.think"); if (th) think.value = th;
   } catch (e) {}
   const show = () => { out.textContent = humanWpm() + " WPM"; $("settings").classList.toggle("human-on", human.checked); };
   const save = () => {
@@ -867,12 +872,14 @@ function checkHumanSupport() {
       localStorage.setItem("phonekb.human", human.checked ? "1" : "0");
       localStorage.setItem("phonekb.wpm", String(humanWpm()));
       localStorage.setItem("phonekb.typos", typos.checked ? "1" : "0");
+      localStorage.setItem("phonekb.think", String(thinkLevel()));
     } catch (e) {}
     delayDirty = true; pump();   // send speed/typos to the Flipper
     if (connected) checkHumanSupport();
   };
   show();
   human.addEventListener("change", save); wpm.addEventListener("input", save); typos.addEventListener("change", save);
+  think.addEventListener("change", save);
 })();
 
 // ---------------- bulk text ----------------

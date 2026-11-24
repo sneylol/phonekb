@@ -122,6 +122,7 @@ void humanize_init(Humanizer* h, HumanizeRandom random, void* random_context) {
     h->wpm = 55;
     h->typos = false;
     h->german = false;
+    h->think = 0;
     h->random = random;
     h->random_context = random_context;
     humanize_reset(h);
@@ -130,6 +131,95 @@ void humanize_init(Humanizer* h, HumanizeRandom random, void* random_context) {
 void humanize_reset(Humanizer* h) {
     h->prev = 0;
     h->word_pace = 1.0f;
+    h->had_text = false;
+    h->sentence_end = false;
+    h->clause_end = false;
+    h->newlines = 0;
+    h->sentences_since_pause = 0;
+    h->sentence_chars = 0;
+    h->line_chars = 0;
+    h->burst = 0;
+}
+
+// ---------------------------------------------------------------- thinking pauses
+
+typedef struct {
+    float sentence_base, sentence_step; // chance per sentence end, grows each sentence without a pause
+    float sentence_median_ms;
+    float paragraph_chance, paragraph_median_ms;
+    float clause_chance, clause_median_ms; // after , ; :
+} ThinkLevel;
+
+static const ThinkLevel think_levels[4] = {
+    {0},
+    {0.08f, 0.12f, 2500.0f, 0.85f, 5000.0f, 0.00f, 0.0f}, // light
+    {0.15f, 0.18f, 4000.0f, 0.95f, 9000.0f, 0.04f, 1500.0f}, // normal
+    {0.25f, 0.25f, 6500.0f, 1.00f, 15000.0f, 0.08f, 2500.0f}, // heavy
+};
+
+static float clampf(float v, float lo, float hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static bool starts_sentence(uint32_t cp) {
+    // A new sentence starts with a capital, a digit or an opening quote/bracket.
+    // "z.B. das" or "3.5" don't end a sentence.
+    return is_upper(cp) || (cp >= '0' && cp <= '9') || cp == '"' || cp == '(' || cp == 0x201E ||
+           cp == 0x201C;
+}
+
+uint32_t humanize_think_ms(Humanizer* h, uint32_t cp) {
+    if(cp == '\n' || cp == '\r') {
+        if(cp == '\n' && h->newlines < 255) h->newlines++;
+        return 0;
+    }
+    if(is_space(cp)) return 0; // decide at the next real character
+
+    float ms = 0;
+    bool after_space = is_space(h->prev);
+    if(h->think > 0 && h->think < 4 && h->had_text) {
+        const ThinkLevel* L = &think_levels[h->think];
+        if(h->newlines == 1 && h->line_chars < 40) {
+            // Short line (greeting, closing, list item): just a brief pause now and then
+            if(uniform(h) < 0.3f) ms = clampf(lognormal(h, 1500.0f, 0.5f), 600.0f, 6000.0f);
+        } else if(h->newlines) {
+            // New paragraph (an empty line before it: a bigger break)
+            if(uniform(h) < L->paragraph_chance) {
+                float median = L->paragraph_median_ms * (h->newlines >= 2 ? 1.3f : 1.0f);
+                ms = clampf(lognormal(h, median, 0.5f), 2500.0f, 60000.0f);
+            }
+            h->sentences_since_pause = 0;
+        } else if(h->sentence_end && after_space && starts_sentence(cp)) {
+            float p = L->sentence_base + L->sentence_step * h->sentences_since_pause;
+            if(h->sentence_chars < 20) p *= 0.4f; // "Ok." "Hi!" rarely need thinking
+            if(p > 0.95f) p = 0.95f;
+            if(uniform(h) < p) {
+                ms = clampf(lognormal(h, L->sentence_median_ms, 0.55f), 1200.0f, 25000.0f);
+                h->sentences_since_pause = 0;
+            } else if(h->sentences_since_pause < 255) {
+                h->sentences_since_pause++;
+            }
+        } else if(h->clause_end && after_space && L->clause_chance > 0) {
+            if(uniform(h) < L->clause_chance)
+                ms = clampf(lognormal(h, L->clause_median_ms, 0.5f), 600.0f, 8000.0f);
+        }
+        // After a long pause the thought comes out in a quicker burst
+        if(ms > 0) h->burst = 2 + (uint8_t)(uniform(h) * 3.0f);
+    }
+
+    // Track sentences and paragraphs
+    bool new_sentence = h->newlines || (h->sentence_end && after_space && starts_sentence(cp));
+    if(new_sentence) h->sentence_chars = 0;
+    if(h->newlines) h->line_chars = 0;
+    h->newlines = 0;
+    h->sentence_end = false;
+    h->clause_end = false;
+    h->had_text = true;
+    if(h->sentence_chars < 65535) h->sentence_chars++;
+    if(h->line_chars < 65535) h->line_chars++;
+    if(cp == '.' || cp == '!' || cp == '?') h->sentence_end = true;
+    if(cp == ',' || cp == ';' || cp == ':') h->clause_end = true;
+    return (uint32_t)ms;
 }
 
 uint32_t humanize_gap_ms(Humanizer* h, uint32_t cp) {
@@ -145,6 +235,10 @@ uint32_t humanize_gap_ms(Humanizer* h, uint32_t cp) {
     bool word_start = !is_space(cp) && (prev == 0 || is_space(prev));
     if(word_start) {
         h->word_pace = 0.85f + 0.33f * uniform(h);
+        if(h->burst) { // just after a thinking pause: type the thought out a bit faster
+            h->word_pace *= 0.85f;
+            h->burst--;
+        }
         g *= 1.3f;
         float u = uniform(h);
         if(u < 0.025f) g += (800.0f + 1700.0f * uniform(h)) * pause; // "thinking"

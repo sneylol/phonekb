@@ -27,6 +27,7 @@ extern "C" {
  *                                                                [2] bit 2 = release all keys/buttons now
  *                                                                [3] = PC keyboard layout (PhoneKbLayout)
  *                                                                [4] bit 1 = humanized text makes typos
+ *                                                                [4] bits 2-3 = thinking pauses 0 off..3 heavy
  *                                                                [5] = humanized speed, words per minute
  *   PROGRESS 19ed82ae-ed21-4c9d-4145-228e68fe0000 read+notify  uint32 LE: RX bytes the Flipper has
  *                                                                finished with (typed, dropped or cleared).
@@ -94,6 +95,7 @@ PhoneKbLayout ble_profile_phone_kb_get_layout(FuriHalBleProfileBase* profile);
 /** Humanized typing settings from CONFIG: speed (WPM) and whether to make typos. */
 uint8_t ble_profile_phone_kb_get_wpm(FuriHalBleProfileBase* profile);
 bool ble_profile_phone_kb_get_typos(FuriHalBleProfileBase* profile);
+uint8_t ble_profile_phone_kb_get_think(FuriHalBleProfileBase* profile);
 
 /** True while the phone has paused typing (CONFIG [2] bit 1). Cleared on disconnect. */
 bool ble_profile_phone_kb_is_paused(FuriHalBleProfileBase* profile);

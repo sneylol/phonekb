@@ -105,6 +105,7 @@ typedef struct {
 
     Humanizer hum; // human-like timing for OpTextHuman
     uint32_t prev_hold; // how long the previous humanized key was held (ms)
+    volatile bool thinking; // in a humanized "thinking" pause (shown on screen)
 } PhoneKb;
 
 // ---------------------------------------------------------------- BLE side
@@ -402,6 +403,7 @@ static void hum_sync(PhoneKb* app) {
     app->hum.wpm = wpm ? wpm : 55;
     app->hum.typos = ble_profile_phone_kb_get_typos(app->profile);
     app->hum.german = ble_profile_phone_kb_get_layout(app->profile) == PhoneKbLayoutDe;
+    app->hum.think = ble_profile_phone_kb_get_think(app->profile);
 }
 
 // Wait in 10 ms steps, holding while paused. Returns false if typing should stop.
@@ -451,6 +453,16 @@ static bool hum_key(PhoneKb* app, uint32_t cp, uint32_t gap) {
 }
 
 static bool hum_type(PhoneKb* app, uint32_t cp) {
+    uint32_t think = humanize_think_ms(&app->hum, cp);
+    if(think) {
+        // A thinking pause: show it on the Flipper, so a long stop is clearly on purpose
+        app->thinking = true;
+        view_port_update(app->view_port);
+        bool ok = hum_wait(app, think);
+        app->thinking = false;
+        view_port_update(app->view_port);
+        if(!ok) return false;
+    }
     return hum_key(app, cp, humanize_gap_ms(&app->hum, cp));
 }
 
@@ -613,6 +625,8 @@ static void draw_cb(Canvas* canvas, void* context) {
             phone = "Phone: checking key...";
         } else if(ble_profile_phone_kb_is_paused(app->profile)) {
             phone = "Phone: PAUSED";
+        } else if(app->thinking) {
+            phone = "Phone: thinking...";
         } else {
             phone = "Phone: connected";
         }

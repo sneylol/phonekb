@@ -133,6 +133,7 @@ typedef struct {
     volatile uint8_t layout;
     volatile uint8_t wpm;
     volatile bool typos;
+    volatile uint8_t think;
     volatile bool link_up;
     PhoneKbRxCallback rx_callback;
     PhoneKbAuthCallback auth_callback;
@@ -210,6 +211,7 @@ static BleEventAckStatus phone_kb_event_handler(void* event, void* context) {
             if(mod->Attr_Data_Length >= 4) p->layout = mod->Attr_Data[3];
             if(mod->Attr_Data_Length >= 6) {
                 p->typos = (mod->Attr_Data[4] & 2) != 0;
+                p->think = (mod->Attr_Data[4] >> 2) & 3;
                 if(mod->Attr_Data[5]) p->wpm = mod->Attr_Data[5];
             }
         }
@@ -388,4 +390,9 @@ uint8_t ble_profile_phone_kb_get_wpm(FuriHalBleProfileBase* profile) {
 bool ble_profile_phone_kb_get_typos(FuriHalBleProfileBase* profile) {
     furi_check(profile && (profile->config == ble_profile_phone_kb));
     return ((BleProfilePhoneKb*)profile)->typos;
+}
+
+uint8_t ble_profile_phone_kb_get_think(FuriHalBleProfileBase* profile) {
+    furi_check(profile && (profile->config == ble_profile_phone_kb));
+    return ((BleProfilePhoneKb*)profile)->think;
 }
