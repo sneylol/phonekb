@@ -106,6 +106,11 @@ typedef struct {
     Humanizer hum; // human-like timing for OpTextHuman
     uint32_t prev_hold; // how long the previous humanized key was held (ms)
     volatile bool thinking; // in a humanized "thinking" pause (shown on screen)
+
+    // Caps Lock on the PC as a pause key while typing
+    bool caps_led; // last Caps Lock state the PC reported
+    bool caps_paused; // paused with Caps Lock
+    bool typing_active; // in the middle of typing a text packet
 } PhoneKb;
 
 // ---------------------------------------------------------------- BLE side
@@ -231,9 +236,33 @@ static void phone_kb_link_changed(PhoneKb* app, bool connected) {
 
 // ---------------------------------------------------------------- HID side
 
+// ---- Caps Lock as a pause key ----
+// The PC tells every keyboard when Caps Lock turns on or off (keyboard LEDs).
+// While the Flipper is typing, or has text waiting, each Caps Lock press pauses
+// or resumes it. When it's idle, Caps Lock is just Caps Lock.
+static bool caps_lock_on(void) {
+    return (furi_hal_hid_get_led_state() & HID_KB_LED_CAPS) != 0;
+}
+
+static void caps_check(PhoneKb* app) {
+    bool on = caps_lock_on();
+    if(on == app->caps_led) return;
+    app->caps_led = on;
+    bool busy = app->typing_active || app->caps_paused ||
+                furi_stream_buffer_bytes_available(app->rx) > 0;
+    if(!busy || ble_profile_phone_kb_is_paused(app->profile)) return; // phone's Pause rules
+    app->caps_paused = !app->caps_paused;
+    view_port_update(app->view_port);
+}
+
+static bool is_paused(PhoneKb* app) {
+    return app->caps_paused || ble_profile_phone_kb_is_paused(app->profile);
+}
+
 // Checked between letters (and every 10 ms of a letter pause): stop typing when
 // the phone taps Stop, the phone disconnects, or Back is pressed on the Flipper.
 static bool typing_should_stop(PhoneKb* app) {
+    caps_check(app);
     uint32_t stops = ble_profile_phone_kb_get_stop_count(app->profile);
     if(stops != app->stop_seen) {
         app->stop_seen = stops;
@@ -289,7 +318,7 @@ static void check_release_request(PhoneKb* app) {
 
 // Hold here while the phone has paused typing. Returns false if typing should stop.
 static bool wait_while_paused(PhoneKb* app) {
-    while(ble_profile_phone_kb_is_paused(app->profile)) {
+    while(is_paused(app)) {
         furi_delay_ms(10);
         check_release_request(app);
         if(typing_should_stop(app)) return false;
@@ -364,6 +393,10 @@ static uint16_t key_for(PhoneKb* app, uint32_t cp, bool* dead) {
     } else {
         key = us_key(cp);
     }
+    // Caps Lock on at the PC inverts letters: flip Shift so the text comes out as sent
+    bool letter = (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z') || cp == 0x00E4 ||
+                  cp == 0x00F6 || cp == 0x00FC || cp == 0x00C4 || cp == 0x00D6 || cp == 0x00DC;
+    if(key != HID_KEYBOARD_NONE && letter && caps_lock_on()) key ^= KEY_MOD_LEFT_SHIFT;
     return key;
 }
 
@@ -554,6 +587,7 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
         break;
     }
     case OpText: {
+        app->typing_active = true;
         for(uint8_t i = 0; i < p[1]; i++) {
             uint32_t cp;
             if(!utf8_feed(app, p[2 + i], &cp)) continue;
@@ -562,11 +596,14 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
                 break;
             }
         }
+        app->typing_active = false;
         view_port_update(app->view_port);
         break;
     }
     case OpTextHuman:
+        app->typing_active = true;
         if(!hum_text(app, &p[2], p[1])) app->typing_aborted = true;
+        app->typing_active = false;
         view_port_update(app->view_port);
         break;
     default:
@@ -580,6 +617,8 @@ static void clear_queue(PhoneKb* app, bool was_typing) {
     app->utf8_left = 0;
     humanize_reset(&app->hum);
     app->prev_hold = 0;
+    app->caps_paused = false; // Stop also ends a Caps Lock pause
+    app->typing_active = false;
     uint8_t junk[64];
     size_t dropped = 0, got;
     while((got = furi_stream_buffer_receive(app->rx, junk, sizeof(junk), 0)) > 0) {
@@ -623,6 +662,8 @@ static void draw_cb(Canvas* canvas, void* context) {
     } else if(app->ble_connected) {
         if(ble_profile_phone_kb_get_auth(app->profile) != PhoneKbAuthOk) {
             phone = "Phone: checking key...";
+        } else if(app->caps_paused) {
+            phone = "PAUSED (Caps Lock)";
         } else if(ble_profile_phone_kb_is_paused(app->profile)) {
             phone = "Phone: PAUSED";
         } else if(app->thinking) {
@@ -669,6 +710,7 @@ int32_t phone_kb_app(void* p) {
     furi_check(furi_hal_usb_set_config(&usb_hid, NULL));
 
     humanize_init(&app->hum, hum_random, NULL);
+    app->caps_led = caps_lock_on();
     token_load(app);
     event_log_start();
     event_log("start, linked phone: %s", app->has_token ? "yes" : "no");
@@ -691,10 +733,12 @@ int32_t phone_kb_app(void* p) {
     bool shown_paused = false;
     uint32_t link_up_at = 0;
     uint32_t published_progress = 0;
+    uint8_t published_state = 0;
     uint32_t logged_dropped = 0;
     while(running) {
         // While paused, leave everything queued where it is
-        bool paused = ble_profile_phone_kb_is_paused(app->profile);
+        caps_check(app);
+        bool paused = is_paused(app);
         size_t n = 0;
         if(paused) {
             furi_delay_ms(30);
@@ -706,10 +750,10 @@ int32_t phone_kb_app(void* p) {
             app->bytes_done += n;
         }
 
-        paused = ble_profile_phone_kb_is_paused(app->profile);
+        paused = is_paused(app);
         if(paused != shown_paused) {
             shown_paused = paused;
-            event_log(paused ? "paused" : "resumed");
+            event_log(paused ? (app->caps_paused ? "paused (Caps Lock)" : "paused") : "resumed");
             view_port_update(app->view_port);
         }
 
@@ -723,9 +767,11 @@ int32_t phone_kb_app(void* p) {
 
         // Tell the phone how far we are, so it sends more exactly when there's room
         uint32_t progress = app->bytes_done + app->rx_dropped;
-        if(progress != published_progress) {
+        uint8_t state = app->caps_paused ? PHONE_KB_STATE_CAPS_PAUSED : 0;
+        if(progress != published_progress || state != published_state) {
             published_progress = progress;
-            ble_profile_phone_kb_publish_progress(app->profile, progress);
+            published_state = state;
+            ble_profile_phone_kb_publish_progress(app->profile, progress, state);
         }
 
         if(app->token_save_pending) {

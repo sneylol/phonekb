@@ -33,6 +33,7 @@ extern "C" {
  *                                                                finished with (typed, dropped or cleared).
  *                                                                The page keeps (sent - this) small, so
  *                                                                the 2 KB buffer never overflows or runs dry.
+ *                                                                [4] = state: bit 0 paused with Caps Lock
  *   INFO   19ed82ae-ed21-4c9d-4145-228e69fe0000  read           [0] = protocol version (2: humanized text)
  */
 #define PHONE_KB_PROTOCOL_VERSION 2
@@ -104,7 +105,16 @@ bool ble_profile_phone_kb_is_paused(FuriHalBleProfileBase* profile);
 uint32_t ble_profile_phone_kb_get_release_count(FuriHalBleProfileBase* profile);
 
 /** Publish PROGRESS (notifies the phone if it subscribed). Call from the app thread. */
-void ble_profile_phone_kb_publish_progress(FuriHalBleProfileBase* profile, uint32_t bytes_done);
+#define PHONE_KB_STATE_CAPS_PAUSED (1 << 0) // paused with Caps Lock on the PC
+
+/**
+ * Publish PROGRESS (notifies the phone if it subscribed): bytes done (uint32 LE)
+ * + 1 state byte (PHONE_KB_STATE_*). Call from the app thread.
+ */
+void ble_profile_phone_kb_publish_progress(
+    FuriHalBleProfileBase* profile,
+    uint32_t bytes_done,
+    uint8_t state);
 
 /** Increments each time the phone asks to stop typing (CONFIG [2] bit 0). */
 uint32_t ble_profile_phone_kb_get_stop_count(FuriHalBleProfileBase* profile);

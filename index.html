@@ -447,6 +447,7 @@ async function openGattOnce() {
 
 function onDisconnected() {
   connected = false; rxChar = null; cfgChar = null; progressChar = null;
+  capsPaused = false;   // the Flipper ends a Caps Lock pause on disconnect
   queue = []; backlogMs = 0; textLog = [];   // the Flipper drops its queue on disconnect, so don't resend stale input
   keepAwake(false);
   setPaused(false, false);   // the Flipper drops its queue on disconnect
@@ -531,6 +532,18 @@ let sentBytes = 0, flipperDone = 0, progBase = 0, progressAt = 0, progressNotify
 let textLog = [];           // text packets in flight: {end: sentBytes after it, letters}
 const progressListening = new WeakSet();
 
+// The Flipper can also be paused from the PC with Caps Lock (PROGRESS byte 4, bit 0)
+let capsPaused = false;
+function setCapsPaused(on) {
+  if (on === capsPaused) return;
+  capsPaused = on;
+  if (on) setStatus("Paused with Caps Lock on the PC: press Caps Lock again to continue", connected);
+  else if (connected && !paused) setStatus("Connected: " + device.name, true);
+}
+function readProgress(dv) {
+  setProgress(dv.getUint32(0, true));
+  setCapsPaused(dv.byteLength >= 5 && (dv.getUint8(4) & 1) === 1);
+}
 function setProgress(raw) {
   flipperDone = Math.min(sentBytes, (raw - progBase) >>> 0);
   progressAt = performance.now();
@@ -551,7 +564,7 @@ async function setupProgress(svc) {
   progressAt = performance.now();
   try {
     if (!progressListening.has(ch)) {
-      ch.addEventListener("characteristicvaluechanged", (e) => { if (ch === progressChar) setProgress(e.target.value.getUint32(0, true)); });
+      ch.addEventListener("characteristicvaluechanged", (e) => { if (ch === progressChar) readProgress(e.target.value); });
       progressListening.add(ch);
     }
     await ch.startNotifications();
@@ -567,7 +580,7 @@ function gatt(fn) { const p = gattChain.then(fn); gattChain = p.catch(() => {});
 async function refreshProgress() {
   const ch = progressChar;
   if (!ch) return;
-  try { const v = await gatt(() => ch.readValue()); if (ch === progressChar) setProgress(v.getUint32(0, true)); } catch (_) {}
+  try { const v = await gatt(() => ch.readValue()); if (ch === progressChar) readProgress(v); } catch (_) {}
 }
 
 // Wait until the Flipper has typed everything sent so far (or cancelled() / disconnect)
@@ -914,7 +927,7 @@ async function typeBulkNow(raw) {
     }
     typeText(text.slice(i, i + 100), true);
     const sentChars = Math.min(i + 100, text.length);
-    const show = () => { if (!paused) setStatus(`Typing ${Math.max(0, sentChars - lettersInFlight())}/${text.length}…`, connected); };
+    const show = () => { if (!paused && !capsPaused) setStatus(`Typing ${Math.max(0, sentChars - lettersInFlight())}/${text.length}…`, connected); };
     show();
     if (progressChar) {
       // Hand the next part over as soon as this one has gone out; flow control
@@ -925,7 +938,7 @@ async function typeBulkNow(raw) {
       await runningWait(100 * msPerLetter(), () => bulkCancel);
     }
   }
-  if (progressChar && !bulkCancel) await waitFlipperDone(() => { if (!paused) setStatus(`Typing ${text.length - lettersInFlight()}/${text.length}…`, connected); return bulkCancel; });
+  if (progressChar && !bulkCancel) await waitFlipperDone(() => { if (!paused && !capsPaused) setStatus(`Typing ${text.length - lettersInFlight()}/${text.length}…`, connected); return bulkCancel; });
   if (!bulkCancel && !connected) showErr("The connection dropped before the Flipper finished typing. Send the rest again once it's back.");
   if (connected && !paused) setStatus("Connected: " + device.name, true);
 }
