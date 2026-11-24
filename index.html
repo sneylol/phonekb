@@ -565,19 +565,29 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
 
 // ---------------- Caps Lock starts the clipboard ----------------
 // Caps Lock pressed on the PC while nothing is being typed: type the phone's
-// clipboard. Afterwards Caps Lock is put back the way it was before the press.
+// clipboard, or, if the browser won't give it (or it's empty), the text in the
+// Send text box. Afterwards Caps Lock is put back the way it was before the press.
 async function capsStart() {
   if (!$("capsClip").checked || !connected || bulkRunning) return;   // while typing, Caps Lock pauses (on the Flipper)
   const capsBefore = !capsOn;   // this press flipped it
-  let text = "";
-  try { text = await navigator.clipboard.readText(); }
-  catch (e) {
-    restoreCaps(capsBefore);
-    showErr("Caps Lock: this browser didn't allow reading the clipboard without a tap. Tap Clipboard on the phone instead.");
-    return;
+  let text = "", clipProblem = "";
+  try {
+    text = await navigator.clipboard.readText();
+    if (!text) clipProblem = "the clipboard is empty";
+  } catch (e) {
+    clipProblem = "this browser didn't allow reading the clipboard without a tap";
   }
-  if (!text) { restoreCaps(capsBefore); showErr("Caps Lock: the phone's clipboard is empty."); return; }
-  showErr("");
+  if (!text) {
+    text = $("bulk").value;   // fallback: the text pasted in the Send text box
+    if (!text) {
+      restoreCaps(capsBefore);
+      showErr("Caps Lock: " + clipProblem + ", and the Send text box is empty. Paste the text into the box (or tap Clipboard).");
+      return;
+    }
+    showErr("Caps Lock: " + clipProblem + ", so the text from the Send text box is typed.");
+  } else {
+    showErr("");
+  }
   await typeBulk(text);
   restoreCaps(capsBefore);
 }
