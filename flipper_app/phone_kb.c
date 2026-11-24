@@ -112,6 +112,8 @@ typedef struct {
     bool caps_led; // last Caps Lock state the PC reported
     bool caps_paused; // paused with Caps Lock
     bool typing_active; // in the middle of typing a text packet
+    uint8_t start_requests; // Caps Lock presses while idle: the phone starts typing its clipboard
+    uint32_t own_caps_until; // tick until which a Caps Lock change is our own key press
 } PhoneKb;
 
 // ---------------------------------------------------------------- BLE side
@@ -249,10 +251,21 @@ static void caps_check(PhoneKb* app) {
     bool on = caps_lock_on();
     if(on == app->caps_led) return;
     app->caps_led = on;
+    // Our own Caps Lock press (phone's Caps button, or restoring Caps Lock after a text)
+    if((int32_t)(app->own_caps_until - furi_get_tick()) > 0) {
+        event_log("Caps Lock %s (own key press)", on ? "on" : "off");
+        return;
+    }
+    if(ble_profile_phone_kb_is_paused(app->profile)) { // the phone's Pause rules
+        event_log("Caps Lock %s (phone paused: ignored)", on ? "on" : "off");
+        return;
+    }
     bool busy = app->typing_active || app->caps_paused ||
                 furi_stream_buffer_bytes_available(app->rx) > 0;
-    if(!busy || ble_profile_phone_kb_is_paused(app->profile)) { // idle, or the phone's Pause rules
-        event_log("Caps Lock %s (not typing: ignored)", on ? "on" : "off");
+    if(!busy) {
+        // Idle: ask the phone to start typing its clipboard (it decides)
+        app->start_requests++;
+        event_log("Caps Lock %s: start request", on ? "on" : "off");
         return;
     }
     app->caps_paused = !app->caps_paused;
@@ -559,12 +572,14 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
     switch(p[0]) {
     case OpTap: {
         uint16_t key = ((uint16_t)p[1] << 8) | p[2];
+        if(p[2] == HID_KEYBOARD_CAPS_LOCK) app->own_caps_until = furi_get_tick() + 800;
         pkb_hid_kb_press(key);
         pkb_hid_kb_release(key);
         app->keys_sent++;
         break;
     }
     case OpKeyDown:
+        if(p[2] == HID_KEYBOARD_CAPS_LOCK) app->own_caps_until = furi_get_tick() + 800;
         pkb_hid_kb_press(((uint16_t)p[1] << 8) | p[2]);
         break;
     case OpKeyUp:
@@ -774,7 +789,9 @@ int32_t phone_kb_app(void* p) {
 
         // Tell the phone how far we are, so it sends more exactly when there's room
         uint32_t progress = app->bytes_done + app->rx_dropped;
-        uint8_t state = app->caps_paused ? PHONE_KB_STATE_CAPS_PAUSED : 0;
+        uint8_t state = (app->caps_paused ? PHONE_KB_STATE_CAPS_PAUSED : 0) |
+                        (app->caps_led ? PHONE_KB_STATE_CAPS_ON : 0) |
+                        (uint8_t)((app->start_requests & 0x0F) << PHONE_KB_STATE_START_SHIFT);
         if(progress != published_progress || state != published_state) {
             published_progress = progress;
             published_state = state;

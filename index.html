@@ -282,6 +282,7 @@
     <label class="humanopt" title="Pause to think every few sentences and before new paragraphs">Thinking
       <select id="think"><option value="0">Off</option><option value="1">Light</option><option value="2">Normal</option><option value="3">Heavy</option></select></label>
     <label><input id="raw" type="checkbox"> No autocorrect</label>
+    <label title="Press Caps Lock on the PC while nothing is being typed: the phone's clipboard gets typed (Caps Lock again pauses / resumes)"><input id="capsClip" type="checkbox" checked> Caps Lock types clipboard</label>
   </div>
 </div>
 
@@ -447,7 +448,7 @@ async function openGattOnce() {
 
 function onDisconnected() {
   connected = false; rxChar = null; cfgChar = null; progressChar = null;
-  capsPaused = false;   // the Flipper ends a Caps Lock pause on disconnect
+  capsPaused = false; lastStartCount = null;   // the Flipper ends a Caps Lock pause on disconnect
   queue = []; backlogMs = 0; textLog = [];   // the Flipper drops its queue on disconnect, so don't resend stale input
   keepAwake(false);
   setPaused(false, false);   // the Flipper drops its queue on disconnect
@@ -533,16 +534,60 @@ let textLog = [];           // text packets in flight: {end: sentBytes after it,
 const progressListening = new WeakSet();
 
 // The Flipper can also be paused from the PC with Caps Lock (PROGRESS byte 4, bit 0)
-let capsPaused = false;
+let capsPaused = false;   // (declared before readProgress uses it)
 function setCapsPaused(on) {
   if (on === capsPaused) return;
   capsPaused = on;
   if (on) setStatus("Paused with Caps Lock on the PC: press Caps Lock again to continue", connected);
   else if (connected && !paused) setStatus("Connected: " + device.name, true);
 }
+// PROGRESS byte 4: bit 0 paused with Caps Lock, bit 1 Caps Lock on, bits 4-7 count of
+// Caps Lock presses while the Flipper was idle ("start typing the clipboard")
+let capsOn = false, lastStartCount = null;
 function readProgress(dv) {
   setProgress(dv.getUint32(0, true));
-  setCapsPaused(dv.byteLength >= 5 && (dv.getUint8(4) & 1) === 1);
+  const st = dv.byteLength >= 5 ? dv.getUint8(4) : 0;
+  setCapsPaused((st & 1) === 1);
+  capsOn = (st & 2) === 2;
+  const count = st >> 4;
+  if (dv.byteLength < 5) return;
+  if (lastStartCount === null || document.visibilityState !== "visible") {
+    lastStartCount = count;   // first reading, or the page was in the background: don't act on old presses
+    return;
+  }
+  if (count !== lastStartCount) {
+    lastStartCount = count;
+    capsStart();
+  }
+}
+// After coming back to the page, take the current count without acting on presses made meanwhile
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") lastStartCount = null; refreshProgress(); });
+
+// ---------------- Caps Lock starts the clipboard ----------------
+// Caps Lock pressed on the PC while nothing is being typed: type the phone's
+// clipboard. Afterwards Caps Lock is put back the way it was before the press.
+async function capsStart() {
+  if (!$("capsClip").checked || !connected || bulkRunning) return;   // while typing, Caps Lock pauses (on the Flipper)
+  const capsBefore = !capsOn;   // this press flipped it
+  let text = "";
+  try { text = await navigator.clipboard.readText(); }
+  catch (e) {
+    restoreCaps(capsBefore);
+    showErr("Caps Lock: this browser didn't allow reading the clipboard without a tap. Tap Clipboard on the phone instead.");
+    return;
+  }
+  if (!text) { restoreCaps(capsBefore); showErr("Caps Lock: the phone's clipboard is empty."); return; }
+  showErr("");
+  await typeBulk(text);
+  restoreCaps(capsBefore);
+}
+(function () {   // remember the "Caps Lock types clipboard" switch on this phone
+  const el = $("capsClip");
+  try { const v = localStorage.getItem("phonekb.capsClip"); if (v !== null) el.checked = v === "1"; } catch (e) {}
+  el.addEventListener("change", () => { try { localStorage.setItem("phonekb.capsClip", el.checked ? "1" : "0"); } catch (e) {} });
+})();
+function restoreCaps(capsBefore) {
+  if (connected && capsOn !== capsBefore) send(OP.TAP, 0, 0x39);   // the Flipper knows this press is its own
 }
 function setProgress(raw) {
   flipperDone = Math.min(sentBytes, (raw - progBase) >>> 0);
