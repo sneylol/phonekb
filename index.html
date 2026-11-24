@@ -37,6 +37,7 @@
   .row { display: grid; gap: 6px; padding: 6px 8px 0; }
   .r2 { grid-template-columns: 1fr 1fr; }
   .r3 { grid-template-columns: 1fr 1fr 1fr; }
+  .r4 { grid-template-columns: 1fr 1fr 1fr 1fr; }
   #lock.on { background: var(--key-active); color: #111; font-weight: 600; }
   .speedrow { display: flex; align-items: center; gap: 8px; padding: 6px 12px 0; color: var(--muted); font-size: 13px; }
   .speedrow input { flex: 1; accent-color: var(--key-active); }
@@ -263,8 +264,9 @@
   </div>
   <div style="padding: 8px 8px 0">
     <textarea id="bulk" placeholder="Paste a block of text here, then tap Send text"></textarea>
-    <div class="row r3" style="padding: 6px 0 0">
+    <div class="row r4" style="padding: 6px 0 0">
       <button id="sendBulk">Send text</button>
+      <button id="clipBulk">Clipboard</button>
       <button id="pauseBulk" class="pausebtn">Pause</button>
       <button id="stopBulk">Stop</button>
     </div>
@@ -324,6 +326,8 @@ function showErr(text) { $("err").textContent = text || ""; const r = document.g
 // ---------------- connection ----------------
 async function connect() {
   showErr("");
+  userStopped = false;
+  stopAutoConnect();
   if (!navigator.bluetooth) {
     showErr("Web Bluetooth isn't available. Open this page in Chrome on Android, over https://.");
     return;
@@ -336,14 +340,81 @@ async function connect() {
       });
       device.addEventListener("gattserverdisconnected", onDisconnected);
     }
-    wantConnected = true;
-    freshConnect = true;     // the user tapped Connect: may link an unlinked Flipper
-    await openGatt();
   } catch (e) {
     if (e.name !== "NotFoundError") showErr(String(e.message || e)); // NotFound = user cancelled picker
     setStatus("Not connected", false);
+    return;
+  }
+  wantConnected = true;
+  freshConnect = true;     // the user tapped Connect: may link an unlinked Flipper
+  $("connect").textContent = "Stop";
+  try {
+    await openGatt();
+  } catch (e) {
+    if (userStopped) return;
+    if (/^(Pairing failed|Wrong key)/.test(e.message)) {   // needs the user
+      showErr(e.message); setStatus("Not connected", false); $("connect").textContent = "Connect";
+      return;
+    }
+    // The Flipper app isn't reachable yet: keep looking by itself
+    wantConnected = true;
+    setStatus("Waiting for the Flipper… open Phone Keyboard on it", false);
+    scheduleReconnect(1500);
   }
 }
+
+// ---------------- auto-connect ----------------
+// After you tap Connect once, the page keeps (re)connecting by itself whenever
+// the Phone Keyboard app is reachable: after the Flipper app restarts, the link
+// drops, or the page is reopened. Only Disconnect (or Stop) ends that.
+let reconnectTimer = null, reconnectDelay = 1000, userStopped = false;
+function rememberAutoConnect(on) { try { localStorage.setItem("phonekb.auto", on ? "1" : "0"); } catch (e) {} }
+function stopAutoConnect() { clearTimeout(reconnectTimer); reconnectTimer = null; }
+function scheduleReconnect(ms) {
+  stopAutoConnect();
+  if (!wantConnected || userStopped) return;
+  reconnectTimer = setTimeout(tryReconnect, ms);
+  $("connect").textContent = "Stop";
+}
+async function tryReconnect() {
+  reconnectTimer = null;
+  if (!wantConnected || userStopped || connected || connecting || !device) return;
+  setStatus("Looking for the Flipper…", false);
+  try {
+    await openGatt();
+    reconnectDelay = 1000;
+  } catch (e) {
+    if (userStopped) return;
+    if (/^(Pairing failed|Wrong key)/.test(e.message)) {   // needs the user
+      showErr(e.message); setStatus("Not connected", false); $("connect").textContent = "Connect";
+      return;
+    }
+    wantConnected = true;     // openGatt gave up; keep looking quietly, a bit slower each time
+    reconnectDelay = Math.min(Math.round(reconnectDelay * 1.5), 5000);
+    setStatus("Waiting for the Flipper… open Phone Keyboard on it", false);
+    scheduleReconnect(reconnectDelay);
+  }
+}
+// Coming back to the page: try right away instead of waiting for the timer
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && wantConnected && !userStopped && !connected && !connecting) scheduleReconnect(100);
+});
+// Page opened again: reconnect to the Flipper used last time without the picker,
+// if the browser remembers it (getDevices); otherwise tap Connect once.
+(async function autoStart() {
+  let want = false;
+  try { want = localStorage.getItem("phonekb.auto") === "1"; } catch (e) {}
+  if (!want || !navigator.bluetooth || !navigator.bluetooth.getDevices) return;
+  try {
+    const known = await navigator.bluetooth.getDevices();
+    const d = known.find((x) => (x.name || "").startsWith("PhoneKB"));
+    if (!d || device) return;
+    device = d;
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+    wantConnected = true; freshConnect = false; userStopped = false;
+    scheduleReconnect(300);
+  } catch (e) {}
+})();
 
 let connecting = false;
 let freshConnect = false;    // false for automatic reconnects
@@ -418,6 +489,7 @@ async function openGattOnce() {
       await rxChar.writeValueWithResponse(new Uint8Array([OP.RELEASE]));
       if (progressChar) sentBytes += 1;   // the Flipper counts this byte too
       connected = true;
+      rememberAutoConnect(true);
       keepAwake(true);
       break;
     } catch (e) {
@@ -439,15 +511,21 @@ function onDisconnected() {
   leftLocked = false; $("lock").classList.remove("on"); $("lock").textContent = "Hold click"; // Flipper releases buttons on disconnect
   setStatus("Disconnected", false);
   $("connect").textContent = "Connect";
-  if (wantConnected) {
+  if (wantConnected && !userStopped) {
     setStatus("Reconnecting…", false);
-    setTimeout(() => { if (wantConnected && !connected) openGatt().catch((e) => { setStatus("Not connected", false); showErr(e.message); }); }, 1000);
+    scheduleReconnect(800);
   }
 }
 
 $("connect").onclick = () => {
-  if (connected) { wantConnected = false; device.gatt.disconnect(); }
-  else if (connecting) { wantConnected = false; try { device.gatt.disconnect(); } catch (_) {} setStatus("Cancelled", false); }
+  if (connected || connecting || reconnectTimer) {   // Disconnect / Stop looking
+    userStopped = true; wantConnected = false;
+    rememberAutoConnect(false);
+    stopAutoConnect();
+    try { device.gatt.disconnect(); } catch (_) {}
+    setStatus("Not connected", false);
+    $("connect").textContent = "Connect";
+  }
   else connect();
 };
 
@@ -821,12 +899,34 @@ async function whilePaused(cancelled) { while (paused && !cancelled()) await sle
 
 // ---------------- bulk text ----------------
 let bulkCancel = false;
-$("sendBulk").onclick = async () => {
-  const text = toAscii($("bulk").value);
+let bulkRunning = false;
+$("sendBulk").onclick = () => typeBulk($("bulk").value);
+// Type whatever was last copied on the phone (the browser may ask to allow pasting)
+$("clipBulk").onclick = async () => {
+  if (!connected) { showErr("Connect to the Flipper first."); return; }
+  let text = "";
+  try { text = await navigator.clipboard.readText(); }
+  catch (e) { showErr("This browser didn't allow reading the clipboard. Paste into the box and tap Send text instead."); return; }
+  if (!text) { showErr("The clipboard is empty."); return; }
+  showErr("");
+  typeBulk(text);
+};
+async function typeBulk(raw) {
+  if (bulkRunning) { showErr("Already typing: tap Stop first."); return; }
+  if (!connected) { showErr("Connect to the Flipper first."); return; }
+  bulkRunning = true;
+  try { await typeBulkNow(raw); } finally { bulkRunning = false; }
+}
+async function typeBulkNow(raw) {
+  const text = toAscii(raw);
   bulkCancel = false;
   for (let i = 0; i < text.length && !bulkCancel; i += 100) {
     await whilePaused(() => bulkCancel);
     if (bulkCancel) break;
+    if (!connected) {   // don't silently drop the rest: the Flipper threw away what it had queued
+      showErr(`The connection dropped while typing (about ${Math.max(0, i - lettersInFlight())} of ${text.length} characters typed). Send the rest again once it's back.`);
+      return;
+    }
     typeText(text.slice(i, i + 100));
     const sentChars = Math.min(i + 100, text.length);
     const show = () => { if (!paused) setStatus(`Typing ${Math.max(0, sentChars - lettersInFlight())}/${text.length}…`, connected); };
@@ -841,8 +941,9 @@ $("sendBulk").onclick = async () => {
     }
   }
   if (progressChar && !bulkCancel) await waitFlipperDone(() => { if (!paused) setStatus(`Typing ${text.length - lettersInFlight()}/${text.length}…`, connected); return bulkCancel; });
+  if (!bulkCancel && !connected) showErr("The connection dropped before the Flipper finished typing. Send the rest again once it's back.");
   if (connected && !paused) setStatus("Connected: " + device.name, true);
-};
+}
 $("pauseBulk").onclick = () => { if (connected) setPaused(!paused); };
 $("stopBulk").onclick = () => { bulkCancel = true; stopTyping(); send(OP.RELEASE); };
 
