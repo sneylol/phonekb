@@ -124,6 +124,7 @@ typedef struct {
     bool caps_paused; // paused with Caps Lock
     bool typing_active; // in the middle of typing a text packet
     uint8_t start_requests; // Caps Lock presses while idle: the phone starts typing its clipboard
+    uint32_t start_request_tick; // when the last start request was made (0 = none pending)
 
     // Stored text (sent by the phone in advance): typed on Caps Lock without the phone
     Storage* storage;
@@ -293,6 +294,7 @@ static void caps_check(PhoneKb* app) {
         }
         // Idle: ask the phone to start typing its clipboard (it decides)
         app->start_requests++;
+        app->start_request_tick = furi_get_tick() | 1;
         event_log("Caps Lock %s: start request", on ? "on" : "off");
         return;
     }
@@ -303,6 +305,28 @@ static void caps_check(PhoneKb* app) {
 
 static bool is_paused(PhoneKb* app) {
     return app->caps_paused || ble_profile_phone_kb_is_paused(app->profile);
+}
+
+// Press Caps Lock ourselves (caps_check knows it's ours) and let the PC update the light
+static void press_own_caps(PhoneKb* app) {
+    app->own_caps_until = furi_get_tick() + 400;
+    pkb_hid_kb_press(HID_KEYBOARD_CAPS_LOCK);
+    furi_delay_ms(30);
+    pkb_hid_kb_release(HID_KEYBOARD_CAPS_LOCK);
+}
+
+// Typing always happens with Caps Lock OFF: with it on, some PCs shift every key
+// (, -> ;  ( -> 8  ? -> ß), not just letters. Waits a moment first, because the
+// user's own Caps Lock key may still be held down, and while it is, the PC
+// ignores a second Caps Lock press. Then checks the PC really switched it off.
+static void ensure_caps_off(PhoneKb* app) {
+    for(int attempt = 0; attempt < 3 && caps_lock_on(); attempt++) {
+        furi_delay_ms(attempt == 0 ? 350 : 250);
+        if(!caps_lock_on()) break;
+        press_own_caps(app);
+        for(int w = 0; w < 50 && caps_lock_on(); w++) furi_delay_ms(10); // the PC's answer
+    }
+    if(caps_lock_on()) event_log("Caps Lock: couldn't switch it off before typing");
 }
 
 // Checked between letters (and every 10 ms of a letter pause): stop typing when
@@ -364,11 +388,15 @@ static void check_release_request(PhoneKb* app) {
 
 // Hold here while the phone has paused typing. Returns false if typing should stop.
 static bool wait_while_paused(PhoneKb* app) {
+    bool waited = false;
     while(is_paused(app)) {
+        waited = true;
         furi_delay_ms(10);
         check_release_request(app);
         if(typing_should_stop(app)) return false;
     }
+    // Resumed (e.g. with Caps Lock): make sure Caps Lock is off before typing on
+    if(waited && caps_lock_on()) ensure_caps_off(app);
     return true;
 }
 
@@ -614,15 +642,6 @@ static void stored_clear(PhoneKb* app) {
     storage_simply_remove(app->storage, STORED_PATH);
 }
 
-// Press Caps Lock ourselves (caps_check knows it's ours) and let the PC update the light
-static void press_own_caps(PhoneKb* app) {
-    app->own_caps_until = furi_get_tick() + 400;
-    pkb_hid_kb_press(HID_KEYBOARD_CAPS_LOCK);
-    furi_delay_ms(30);
-    pkb_hid_kb_release(HID_KEYBOARD_CAPS_LOCK);
-    furi_delay_ms(80);
-}
-
 // Type the stored text: Caps Lock was pressed while idle. Works without the phone.
 static void stored_type(PhoneKb* app) {
     app->stored_ready = false; // used once
@@ -639,7 +658,7 @@ static void stored_type(PhoneKb* app) {
     view_port_update(app->view_port);
 
     // Type with Caps Lock off: with it on, some systems change more than letters (ß -> ?)
-    if(caps_lock_on()) press_own_caps(app);
+    ensure_caps_off(app);
 
     bool ok = true;
     uint8_t buf[64];
@@ -663,9 +682,21 @@ static void stored_type(PhoneKb* app) {
     app->caps_paused = false;
     release_everything(app);
     // Caps Lock back to how it was before the press that started this
-    if(caps_lock_on() != app->stored_caps_before) press_own_caps(app);
+    if(caps_lock_on() != app->stored_caps_before) {
+        press_own_caps(app);
+        furi_delay_ms(80);
+    }
     event_log(ok ? "stored text typed" : "stored text stopped");
     view_port_update(app->view_port);
+}
+
+// First text after a Caps Lock start request (the phone types its clipboard or box):
+// make sure Caps Lock is off, whatever the phone managed to do about it.
+static void caps_start_check(PhoneKb* app) {
+    if(!app->start_request_tick) return;
+    bool recent = furi_get_tick() - app->start_request_tick < 15000;
+    app->start_request_tick = 0;
+    if(recent && caps_lock_on()) ensure_caps_off(app);
 }
 
 static void execute_packet(PhoneKb* app, const uint8_t* p) {
@@ -708,6 +739,7 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
     }
     case OpText: {
         app->typing_active = true;
+        caps_start_check(app);
         for(uint8_t i = 0; i < p[1]; i++) {
             uint32_t cp;
             if(!utf8_feed(app, p[2 + i], &cp)) continue;
@@ -722,6 +754,7 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
     }
     case OpTextHuman:
         app->typing_active = true;
+        caps_start_check(app);
         if(!hum_text(app, &p[2], p[1])) app->typing_aborted = true;
         app->typing_active = false;
         view_port_update(app->view_port);

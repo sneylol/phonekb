@@ -603,10 +603,9 @@ async function capsStart() {
   } else {
     showErr("");
   }
-  // Type with Caps Lock OFF: with Caps Lock on, some systems change more than
-  // letters (e.g. ß becomes ?). The press that started this turned it on, so
-  // switch it off first; Caps Lock still pauses (on) and resumes (off) as usual.
-  if (capsOn) send(OP.TAP, 0, 0x39);
+  // Typing happens with Caps Lock OFF (with it on, some PCs shift every key: , -> ;
+  // ß -> ?). The Flipper switches it off itself before the first letter and checks
+  // that the PC really did (the user's key may still be held down at this moment).
   await typeBulk(text);
   restoreCaps(capsBefore);   // back to how it was before the press
 }
