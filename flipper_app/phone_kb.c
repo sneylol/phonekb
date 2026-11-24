@@ -22,11 +22,14 @@
  *                        on the PC layout the phone set (US or German)
  *   0x09 mods key        key down (hold)
  *   0x0A mods key        key up
+ *   0x0B len bytes...    like 0x08, but typed like a person (humanize.c): human
+ *                        rhythm and pauses at the CONFIG speed, optional typos
  */
 
 #include <stdarg.h>
 #include <furi.h>
 #include <furi_hal_bt.h>
+#include <furi_hal_random.h>
 #include <furi_hal_usb.h>
 #include <furi_hal_usb_hid.h>
 #include <gui/gui.h>
@@ -37,6 +40,7 @@
 
 #include "phone_kb_profile.h"
 #include "layout_de.h"
+#include "humanize.h"
 
 #define TAG              "PhoneKB"
 #define KEYS_PATH        APP_DATA_PATH(".phone_kb.keys")
@@ -61,6 +65,7 @@ typedef enum {
     OpText = 0x08,
     OpKeyDown = 0x09,
     OpKeyUp = 0x0A,
+    OpTextHuman = 0x0B,
 } Op;
 
 typedef struct {
@@ -97,6 +102,9 @@ typedef struct {
     uint16_t pkt_len;
     uint32_t utf8_cp; // UTF-8 character being decoded (may span packets)
     uint8_t utf8_left; // continuation bytes still expected
+
+    Humanizer hum; // human-like timing for OpTextHuman
+    uint32_t prev_hold; // how long the previous humanized key was held (ms)
 } PhoneKb;
 
 // ---------------------------------------------------------------- BLE side
@@ -345,19 +353,28 @@ static uint16_t us_key(uint32_t cp) {
     return HID_ASCII_TO_KEY(cp);
 }
 
+// Key (usage + modifiers) for a character on the PC's layout, or NONE.
+// *dead: a dead key (^ ´ `) that needs Space after it to type the accent itself.
+static uint16_t key_for(PhoneKb* app, uint32_t cp, bool* dead) {
+    uint16_t key = HID_KEYBOARD_NONE;
+    *dead = false;
+    if(ble_profile_phone_kb_get_layout(app->profile) == PhoneKbLayoutDe) {
+        if(!layout_de_lookup(cp, &key, dead)) key = HID_KEYBOARD_NONE;
+    } else {
+        key = us_key(cp);
+    }
+    return key;
+}
+
 // Type one character on the PC's layout. Returns false if typing should stop.
 static bool type_codepoint(PhoneKb* app, uint32_t cp) {
     if(typing_should_stop(app)) return false;
     if(!wait_while_paused(app)) return false;
 
-    uint16_t key = HID_KEYBOARD_NONE;
-    bool dead = false;
-    if(ble_profile_phone_kb_get_layout(app->profile) == PhoneKbLayoutDe) {
-        if(!layout_de_lookup(cp, &key, &dead)) key = HID_KEYBOARD_NONE;
-    } else {
-        key = us_key(cp);
-    }
+    bool dead;
+    uint16_t key = key_for(app, cp, &dead);
     if(key == HID_KEYBOARD_NONE) return true; // can't be typed on this layout: skip it
+    app->prev_hold = 0;
 
     furi_hal_hid_kb_press(key);
     furi_hal_hid_kb_release(key);
@@ -370,6 +387,100 @@ static bool type_codepoint(PhoneKb* app, uint32_t cp) {
     remember_char(app, cp);
     // Pause between letters; set from the phone's "Letter delay" slider
     return letter_pause(app);
+}
+
+// ---------------------------------------------------------------- humanized typing
+
+static uint32_t hum_random(void* context) {
+    UNUSED(context);
+    return furi_hal_random_get();
+}
+
+// Take the phone's current Humanize settings
+static void hum_sync(PhoneKb* app) {
+    uint8_t wpm = ble_profile_phone_kb_get_wpm(app->profile);
+    app->hum.wpm = wpm ? wpm : 55;
+    app->hum.typos = ble_profile_phone_kb_get_typos(app->profile);
+    app->hum.german = ble_profile_phone_kb_get_layout(app->profile) == PhoneKbLayoutDe;
+}
+
+// Wait in 10 ms steps, holding while paused. Returns false if typing should stop.
+static bool hum_wait(PhoneKb* app, uint32_t ms) {
+    while(ms > 0) {
+        uint32_t step = ms < 10 ? ms : 10;
+        furi_delay_ms(step);
+        ms -= step;
+        if(typing_should_stop(app)) return false;
+        if(!wait_while_paused(app)) return false;
+    }
+    return true;
+}
+
+// Press one key `gap` ms after the previous press, hold it like a person.
+// Returns false if typing should stop.
+static bool hum_key(PhoneKb* app, uint32_t cp, uint32_t gap) {
+    if(typing_should_stop(app)) return false;
+    if(!wait_while_paused(app)) return false;
+    bool dead;
+    uint16_t key = key_for(app, cp, &dead);
+    // The gap runs from the previous press; part of it was spent holding that key
+    if(!hum_wait(app, gap > app->prev_hold ? gap - app->prev_hold : 0)) return false;
+    if(key == HID_KEYBOARD_NONE) { // can't be typed on this layout: skip it
+        app->prev_hold = 0;
+        return true;
+    }
+    uint32_t hold = humanize_hold_ms(&app->hum, gap);
+    furi_hal_hid_kb_press(key);
+    furi_delay_ms(hold);
+    furi_hal_hid_kb_release(key);
+    if(dead) { // Space after a dead key, a quick second press
+        furi_delay_ms(40 + hold / 2);
+        furi_hal_hid_kb_press(HID_KEYBOARD_SPACEBAR);
+        furi_delay_ms(hold * 3 / 4);
+        furi_hal_hid_kb_release(HID_KEYBOARD_SPACEBAR);
+    }
+    app->prev_hold = hold;
+    app->keys_sent++;
+    if(cp == '\b') {
+        size_t cur = strlen(app->last_text);
+        if(cur) app->last_text[cur - 1] = '\0';
+    } else {
+        remember_char(app, cp);
+    }
+    return true;
+}
+
+static bool hum_type(PhoneKb* app, uint32_t cp) {
+    return hum_key(app, cp, humanize_gap_ms(&app->hum, cp));
+}
+
+// Type a text packet like a person, with an occasional typo that is noticed
+// (at once or a letter or two later) and fixed with Backspace.
+static bool hum_text(PhoneKb* app, const uint8_t* t, uint8_t len) {
+    hum_sync(app);
+    for(uint8_t i = 0; i < len; i++) {
+        uint32_t cp;
+        if(!utf8_feed(app, t[i], &cp)) continue;
+        uint32_t wrong;
+        uint8_t late;
+        if(humanize_typo(&app->hum, cp, &wrong, &late)) {
+            // "Noticed late" only over plain characters that are in this packet
+            uint8_t extra = 0;
+            while(extra < late && i + 1 + extra < len && t[i + 1 + extra] >= 0x20 &&
+                  t[i + 1 + extra] < 0x7F)
+                extra++;
+            if(!hum_type(app, wrong)) return false;
+            for(uint8_t k = 0; k < extra; k++)
+                if(!hum_type(app, t[i + 1 + k])) return false;
+            if(!hum_wait(app, humanize_notice_ms(&app->hum))) return false;
+            for(uint8_t k = 0; k <= extra; k++)
+                if(!hum_key(app, '\b', humanize_backspace_gap_ms(&app->hum))) return false;
+            app->hum.prev = '\b';
+            // the characters typed after the typo are typed again by this loop
+        }
+        if(!hum_type(app, cp)) return false;
+    }
+    return true;
 }
 
 static uint16_t packet_length(const uint8_t* p, uint16_t have) {
@@ -387,6 +498,7 @@ static uint16_t packet_length(const uint8_t* p, uint16_t have) {
     case OpReleaseAll:
         return 1;
     case OpText:
+    case OpTextHuman:
         return (have < 2) ? 0xFFFF : (uint16_t)(2 + p[1]);
     default:
         return 1; // unknown byte: skip it to resync
@@ -441,6 +553,10 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
         view_port_update(app->view_port);
         break;
     }
+    case OpTextHuman:
+        if(!hum_text(app, &p[2], p[1])) app->typing_aborted = true;
+        view_port_update(app->view_port);
+        break;
     default:
         break;
     }
@@ -450,6 +566,8 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
 static void clear_queue(PhoneKb* app, bool was_typing) {
     app->pkt_len = 0;
     app->utf8_left = 0;
+    humanize_reset(&app->hum);
+    app->prev_hold = 0;
     uint8_t junk[64];
     size_t dropped = 0, got;
     while((got = furi_stream_buffer_receive(app->rx, junk, sizeof(junk), 0)) > 0) {
@@ -536,6 +654,7 @@ int32_t phone_kb_app(void* p) {
     furi_hal_usb_unlock();
     furi_check(furi_hal_usb_set_config(&usb_hid, NULL));
 
+    humanize_init(&app->hum, hum_random, NULL);
     token_load(app);
     event_log_start();
     event_log("start, linked phone: %s", app->has_token ? "yes" : "no");

@@ -52,6 +52,7 @@
   #more.open { display: block; }
   textarea { width: 100%; height: 80px; font: inherit; background: var(--panel); color: var(--text);
     border: 1px solid #333843; border-radius: 8px; padding: 8px; }
+  .settings:not(.human-on) .humanopt { display: none; }
   .settings { display: flex; flex-wrap: wrap; gap: 8px 16px; padding: 8px 10px; color: var(--muted); font-size: 13px; align-items: center; }
   .settings input[type=range] { width: 110px; accent-color: var(--key-active); }
   #err { color: var(--bad); padding: 0 12px; font-size: 13px; }
@@ -271,9 +272,12 @@
       <button id="stopBulk">Stop</button>
     </div>
   </div>
-  <div class="settings">
+  <div class="settings" id="settings">
     <label>Scroll <input id="scrollSpeed" type="range" min="0.2" max="3" step="0.1" value="1"></label>
     <label>Letter delay <input id="typeDelay" type="range" min="0" max="31" step="1" value="2"> <output id="typeDelayVal">2 ms</output></label>
+    <label title="Send text, Clipboard and macros are typed like a person: natural rhythm, pauses, key presses"><input id="human" type="checkbox"> Humanize</label>
+    <label class="humanopt">Speed <input id="wpm" type="range" min="15" max="150" step="5" value="55"> <output id="wpmVal">55 WPM</output></label>
+    <label class="humanopt" title="Now and then hit a neighbouring key and fix it with Backspace"><input id="typos" type="checkbox"> Typos</label>
     <label><input id="raw" type="checkbox"> No autocorrect</label>
   </div>
 </div>
@@ -292,6 +296,7 @@ const RX_CHAR = "19ed82ae-ed21-4c9d-4145-228e62fe0000"; // phone -> Flipper
 // No-PIN Flipper app: the page proves itself with a saved random secret instead of Bluetooth pairing
 const AUTH_CHAR = "19ed82ae-ed21-4c9d-4145-228e65fe0000";   // write 16-byte secret
 const STATUS_CHAR = "19ed82ae-ed21-4c9d-4145-228e66fe0000"; // read: 0 waiting, 1 ok, 2 rejected
+const INFO_CHAR = "19ed82ae-ed21-4c9d-4145-228e69fe0000";     // read: [0] = Flipper app protocol version
 const PROGRESS_CHAR = "19ed82ae-ed21-4c9d-4145-228e68fe0000"; // read/notify: uint32 LE bytes the Flipper is done with
 const CONFIG_CHAR = "19ed82ae-ed21-4c9d-4145-228e67fe0000"; // write: [0..1] ms pause per letter, [2] bit0 stop / bit1 paused, [3] layout (0 US, 1 DE)
 
@@ -309,7 +314,7 @@ function getSecret() {
 }
 
 // ---- protocol opcodes (must match phone_kb.c) ----
-const OP = { TAP: 1, MOVE: 2, DOWN: 3, UP: 4, SCROLL: 5, RELEASE: 6, CONSUMER: 7, TEXT: 8, KDOWN: 9, KUP: 10 };
+const OP = { TAP: 1, MOVE: 2, DOWN: 3, UP: 4, SCROLL: 5, RELEASE: 6, CONSUMER: 7, TEXT: 8, KDOWN: 9, KUP: 10, HTEXT: 11 };
 const KEY = { ENTER: 0x28, BKSP: 0x2A, TAB: 0x2B, SPACE: 0x2C };
 
 const $ = (id) => document.getElementById(id);
@@ -409,6 +414,9 @@ async function openGattOnce() {
     try { cfgChar = await svc.getCharacteristic(CONFIG_CHAR); } catch (_) { cfgChar = null; }
     delayDirty = true; stopPending = false;   // a Stop tapped while offline must not hit the next text
     await setupProgress(svc);
+    flipperVersion = 0;
+    try { flipperVersion = (await (await svc.getCharacteristic(INFO_CHAR)).readValue()).getUint8(0); } catch (_) {}
+    checkHumanSupport();
   } else {
     // First write needs an encrypted, bonded link. Android shows its pairing
     // dialog here: type the 6-digit PIN that appears on the Flipper's screen.
@@ -528,8 +536,9 @@ function setProgress(raw) {
 }
 function inFlight() { return progressChar ? Math.max(0, sentBytes - flipperDone) : 0; }
 function lettersInFlight() { let n = 0; for (const t of textLog) if (t.end > flipperDone) n += t.letters; return n; }
+function textMsInFlight() { let n = 0; for (const t of textLog) if (t.end > flipperDone) n += t.ms; return n; }
 // How long the Flipper still needs for the text it has (ms)
-function flipperBusyMs() { return progressChar ? lettersInFlight() * msPerLetter() : backlog(); }
+function flipperBusyMs() { return progressChar ? textMsInFlight() : backlog(); }
 
 async function setupProgress(svc) {
   progressChar = null; progressNotify = false; textLog = []; sentBytes = 0; flipperDone = 0;
@@ -580,7 +589,9 @@ async function pump() {
         delayDirty = false; stopPending = false; releasePending = false;
         try {
           // [3] = PC layout, so the Flipper presses the right keys for y/z, umlauts, symbols
-          await gatt(() => cfgChar.writeValueWithResponse(new Uint8Array([d & 0xFF, d >> 8, flags, GERMAN_PC ? 1 : 0])));
+          // [4] bit 1 = typos, [5] = WPM for humanized text
+          await gatt(() => cfgChar.writeValueWithResponse(new Uint8Array([d & 0xFF, d >> 8, flags, GERMAN_PC ? 1 : 0,
+                                                                          $("typos").checked ? 2 : 0, humanWpm()])));
         } catch (e) {
           delayDirty = true; if (flags & 1) stopPending = true; if (flags & 4) releasePending = true;   // try again
           throw e;
@@ -588,7 +599,12 @@ async function pump() {
         if (flags & 1) textLog = [];   // Stop: the Flipper throws away what it had
       }
       flushMotion();
-      if (!queue.length) break;
+      if (!queue.length) {
+        // A setting, Stop, Pause or release may have come in while the last write
+        // was in flight: send it now instead of waiting for the next input
+        if (cfgChar && (delayDirty || stopPending || releasePending)) continue;
+        break;
+      }
 
       if (progressChar) {
         if (inFlight() + queue[0].length > FLOW_MAX) {
@@ -624,7 +640,8 @@ async function pump() {
       if (!progressChar) backlogMs += cost;
       for (const p of pk) {
         sentBytes += p.length;
-        if (p[0] === OP.TEXT) textLog.push({ end: sentBytes, letters: p[1] });
+        if (p[0] === OP.TEXT || p[0] === OP.HTEXT)
+          textLog.push({ end: sentBytes, letters: p[1], ms: p[1] * (p[0] === OP.HTEXT ? humanMsPerLetter() : msPerLetter()) });
       }
       sendFails = 0;
     }
@@ -710,9 +727,12 @@ function toAscii(s) {
     .replace(/[^\x09\x0A\x20-\x7EäöüÄÖÜß§°´²³€µ]/g, "");
 }
 
-function typeText(s) {
+// human: typed like a person if Humanize is on (Send text, Clipboard, macros);
+// live typing on the phone keyboard is always sent as is
+function typeText(s, human = false) {
   s = toAscii(s);
   if (!s) return;
+  const op = human && humanOn() ? OP.HTEXT : OP.TEXT;
   if (mods) {                          // e.g. Ctrl armed + "c" => Ctrl+C
     for (const ch of s) { const k = charToKey(ch); if (k) tap(k); }
     return;
@@ -721,7 +741,7 @@ function typeText(s) {
   const bytes = Array.from(new TextEncoder().encode(s));
   for (let i = 0; i < bytes.length; i += TEXT_CHUNK) {
     const part = bytes.slice(i, i + TEXT_CHUNK);
-    send(OP.TEXT, part.length, ...part);
+    send(op, part.length, ...part);
   }
 }
 
@@ -822,6 +842,39 @@ async function whilePaused(cancelled) { while (paused && !cancelled()) await sle
   });
 })();
 
+// ---------------- humanize ----------------
+// Typing like a person is done on the Flipper (exact timing on USB): the page
+// only sends the speed and whether to make typos, and marks text as "humanized".
+let flipperVersion = 0;
+function humanWpm() { return Math.max(15, Math.min(150, Math.round(+$("wpm").value || 55))); }
+function humanOn() { return $("human").checked && flipperVersion >= 2; }
+function humanMsPerLetter() { return 12000 / humanWpm() * 1.1; }   // average incl. pauses
+function checkHumanSupport() {
+  if ($("human").checked && cfgChar && flipperVersion < 2)
+    showErr("Humanize needs the newer Phone Keyboard app on the Flipper; text is typed normally until then.");
+}
+(function () {
+  const human = $("human"), wpm = $("wpm"), out = $("wpmVal"), typos = $("typos");
+  try {
+    human.checked = localStorage.getItem("phonekb.human") === "1";
+    const w = localStorage.getItem("phonekb.wpm"); if (w) wpm.value = w;
+    typos.checked = localStorage.getItem("phonekb.typos") === "1";
+  } catch (e) {}
+  const show = () => { out.textContent = humanWpm() + " WPM"; $("settings").classList.toggle("human-on", human.checked); };
+  const save = () => {
+    show();
+    try {
+      localStorage.setItem("phonekb.human", human.checked ? "1" : "0");
+      localStorage.setItem("phonekb.wpm", String(humanWpm()));
+      localStorage.setItem("phonekb.typos", typos.checked ? "1" : "0");
+    } catch (e) {}
+    delayDirty = true; pump();   // send speed/typos to the Flipper
+    if (connected) checkHumanSupport();
+  };
+  show();
+  human.addEventListener("change", save); wpm.addEventListener("input", save); typos.addEventListener("change", save);
+})();
+
 // ---------------- bulk text ----------------
 let bulkCancel = false;
 let bulkRunning = false;
@@ -852,7 +905,7 @@ async function typeBulkNow(raw) {
       showErr(`The connection dropped while typing (about ${Math.max(0, i - lettersInFlight())} of ${text.length} characters typed). Send the rest again once it's back.`);
       return;
     }
-    typeText(text.slice(i, i + 100));
+    typeText(text.slice(i, i + 100), true);
     const sentChars = Math.min(i + 100, text.length);
     const show = () => { if (!paused) setStatus(`Typing ${Math.max(0, sentChars - lettersInFlight())}/${text.length}…`, connected); };
     show();
@@ -1080,7 +1133,7 @@ async function runStep(s) {
         const part = t.slice(i, i + 100);
         await whilePaused(() => stopFlag);
         if (stopFlag) break;
-        typeText(part); await waitIdle();
+        typeText(part, true); await waitIdle();
         // let the Flipper finish typing before the next step
         if (progressChar) await waitFlipperDone(() => stopFlag);
         else await wait(part.length * msPerLetter() + 30);
