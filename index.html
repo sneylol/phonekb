@@ -53,6 +53,8 @@
   textarea { width: 100%; height: 80px; font: inherit; background: var(--panel); color: var(--text);
     border: 1px solid #333843; border-radius: 8px; padding: 8px; }
   .settings:not(.human-on) .humanopt { display: none; }
+  .storeinfo { font-size: 12px; color: var(--muted); padding: 4px 2px 0; min-height: 0; }
+  .storeinfo.ready { color: var(--ok); }
   .settings select { background: var(--key); color: var(--text); border: 0; border-radius: 6px; padding: 3px 6px; font-size: 13px; }
   .settings { display: flex; flex-wrap: wrap; gap: 8px 16px; padding: 8px 10px; color: var(--muted); font-size: 13px; align-items: center; }
   .settings input[type=range] { width: 110px; accent-color: var(--key-active); }
@@ -272,6 +274,7 @@
       <button id="pauseBulk" class="pausebtn">Pause</button>
       <button id="stopBulk">Stop</button>
     </div>
+    <div id="storeInfo" class="storeinfo"></div>
   </div>
   <div class="settings" id="settings">
     <label>Scroll <input id="scrollSpeed" type="range" min="0.2" max="3" step="0.1" value="1"></label>
@@ -318,7 +321,8 @@ function getSecret() {
 }
 
 // ---- protocol opcodes (must match phone_kb.c) ----
-const OP = { TAP: 1, MOVE: 2, DOWN: 3, UP: 4, SCROLL: 5, RELEASE: 6, CONSUMER: 7, TEXT: 8, KDOWN: 9, KUP: 10, HTEXT: 11 };
+const OP = { TAP: 1, MOVE: 2, DOWN: 3, UP: 4, SCROLL: 5, RELEASE: 6, CONSUMER: 7, TEXT: 8, KDOWN: 9, KUP: 10, HTEXT: 11,
+             STORE_BEGIN: 12, STORE_DATA: 13, STORE_END: 14 };
 const KEY = { ENTER: 0x28, BKSP: 0x2A, TAB: 0x2B, SPACE: 0x2C };
 
 const $ = (id) => document.getElementById(id);
@@ -421,6 +425,11 @@ async function openGattOnce() {
     flipperVersion = 0;
     try { flipperVersion = (await (await svc.getCharacteristic(INFO_CHAR)).readValue()).getUint8(0); } catch (_) {}
     checkHumanSupport();
+    // Store the box text if it never was (or sending it was cut off). If it was
+    // stored before and the Flipper no longer has it, it was typed (or the Flipper
+    // app restarted): then only editing the text stores it again.
+    const box = $("bulk").value;
+    if (storing || (box && storedText === null && box !== typedText)) { storing = false; scheduleStore(300); }
   } else {
     // First write needs an encrypted, bonded link. Android shows its pairing
     // dialog here: type the 6-digit PIN that appears on the Flipper's screen.
@@ -549,6 +558,7 @@ function readProgress(dv) {
   const st = dv.byteLength >= 5 ? dv.getUint8(4) : 0;
   setCapsPaused((st & 1) === 1);
   capsOn = (st & 2) === 2;
+  setStoredReady((st & 4) === 4);
   const count = st >> 4;
   if (dv.byteLength < 5) return;
   if (lastStartCount === null || document.visibilityState !== "visible") {
@@ -579,6 +589,11 @@ async function capsStart() {
   }
   if (!text) {
     text = $("bulk").value;   // fallback: the text pasted in the Send text box
+    if (text && text === typedText) {   // already typed once (stored text is used once)
+      restoreCaps(capsBefore);
+      showErr("Caps Lock: the text in the box was already typed. Edit or paste new text to type it again.");
+      return;
+    }
     if (!text) {
       restoreCaps(capsBefore);
       showErr("Caps Lock: " + clipProblem + ", and the Send text box is empty. Paste the text into the box (or tap Clipboard).");
@@ -588,8 +603,12 @@ async function capsStart() {
   } else {
     showErr("");
   }
+  // Type with Caps Lock OFF: with Caps Lock on, some systems change more than
+  // letters (e.g. ß becomes ?). The press that started this turned it on, so
+  // switch it off first; Caps Lock still pauses (on) and resumes (off) as usual.
+  if (capsOn) send(OP.TAP, 0, 0x39);
   await typeBulk(text);
-  restoreCaps(capsBefore);
+  restoreCaps(capsBefore);   // back to how it was before the press
 }
 (function () {   // remember the "Caps Lock types clipboard" switch on this phone
   const el = $("capsClip");
@@ -615,7 +634,8 @@ async function setupProgress(svc) {
   progressChar = null; progressNotify = false; textLog = []; sentBytes = 0; flipperDone = 0;
   let ch;
   try { ch = await svc.getCharacteristic(PROGRESS_CHAR); } catch (_) { return; }   // older Flipper app
-  progBase = (await ch.readValue()).getUint32(0, true);
+  const first = await ch.readValue();
+  progBase = first.getUint32(0, true);
   progressAt = performance.now();
   try {
     if (!progressListening.has(ch)) {
@@ -626,6 +646,7 @@ async function setupProgress(svc) {
     progressNotify = true;
   } catch (_) { /* no notifications: we read it when we need it */ }
   progressChar = ch;
+  readProgress(first);   // state (stored text, Caps Lock) without acting on old Caps Lock presses
 }
 
 // Web Bluetooth allows one GATT operation at a time: run them in order
@@ -946,14 +967,70 @@ function checkHumanSupport() {
     if (connected) checkHumanSupport();
   };
   show();
-  human.addEventListener("change", save); wpm.addEventListener("input", save); typos.addEventListener("change", save);
+  human.addEventListener("change", () => { save(); if (storedText) scheduleStore(100); });
+  wpm.addEventListener("input", save); typos.addEventListener("change", save);
   think.addEventListener("change", save);
 })();
 
 // ---------------- bulk text ----------------
 let bulkCancel = false;
 let bulkRunning = false;
-$("sendBulk").onclick = () => typeBulk($("bulk").value);
+$("sendBulk").onclick = () => {
+  // Typing it now uses it up: don't leave it stored for Caps Lock as well
+  if (storedReady || storing) { typedText = $("bulk").value; clearStored(); }
+  typeBulk($("bulk").value);
+};
+
+// ---------------- stored text ----------------
+// The text in the box is sent to the Flipper in advance and saved there. Then a
+// Caps Lock press on the PC makes the Flipper type it by itself, even with the
+// phone locked. It's used once; edit or paste new text to store it again.
+let storeTimer = null, storing = false, storedReady = false, storedText = null, typedText = null;
+const STORE_MAX_CHARS = 20000;
+function storeAvailable() { return connected && flipperVersion >= 3 && $("capsClip").checked; }
+function showStoreInfo() {
+  const el = $("storeInfo"), box = $("bulk").value;
+  let text = "", ok = false;
+  if (connected && flipperVersion >= 3 && $("capsClip").checked && box) {
+    if (storedReady && storedText === box) { text = "✓ Stored on the Flipper: press Caps Lock on the PC to type it (you can lock the phone)"; ok = true; }
+    else if (typedText === box) text = "Typed on the PC. Edit or paste new text to store it again.";
+    else text = "Sending the text to the Flipper…";
+  }
+  el.textContent = text;
+  el.classList.toggle("ready", ok);
+}
+function setStoredReady(on) {
+  if (on === storedReady) return;
+  if (!on && storedReady && !storing && storedText !== null) typedText = storedText;   // the Flipper typed it (used once)
+  if (on) storing = false;
+  storedReady = on;
+  showStoreInfo();
+}
+function scheduleStore(ms) { clearTimeout(storeTimer); storeTimer = setTimeout(storeNow, ms); showStoreInfo(); }
+function sendStore(text, human) {
+  storing = true;
+  send(OP.STORE_BEGIN);
+  const bytes = Array.from(new TextEncoder().encode(text));
+  for (let i = 0; i < bytes.length; i += TEXT_CHUNK) {
+    const part = bytes.slice(i, i + TEXT_CHUNK);
+    send(OP.STORE_DATA, part.length, ...part);
+  }
+  send(OP.STORE_END, human ? 1 : 0);
+}
+function clearStored() { if (connected && flipperVersion >= 3) { sendStore("", false); storing = false; } storedText = null; showStoreInfo(); }
+function storeNow() {
+  storeTimer = null;
+  if (!connected || flipperVersion < 3) return;
+  if (paused || bulkRunning) { scheduleStore(1500); return; }   // input is held while paused; don't mix with typing
+  const box = $("bulk").value;
+  const text = $("capsClip").checked && box !== typedText ? toAscii(box.slice(0, STORE_MAX_CHARS)) : "";
+  sendStore(text, humanOn());
+  if (!text) storing = false;
+  storedText = text ? box : null;
+  showStoreInfo();
+}
+$("bulk").addEventListener("input", () => { typedText = null; scheduleStore(800); });
+$("capsClip").addEventListener("change", () => scheduleStore(100));
 // Type whatever was last copied on the phone (the browser may ask to allow pasting)
 $("clipBulk").onclick = async () => {
   if (!connected) { showErr("Connect to the Flipper first."); return; }

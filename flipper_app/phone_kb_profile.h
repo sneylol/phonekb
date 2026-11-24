@@ -34,10 +34,11 @@ extern "C" {
  *                                                                The page keeps (sent - this) small, so
  *                                                                the 2 KB buffer never overflows or runs dry.
  *                                                                [4] = state: bit 0 paused with Caps Lock,
- *                                                                bit 1 Caps Lock on, bits 4-7 start requests
+ *                                                                bit 1 Caps Lock on, bit 2 stored text ready,
+ *                                                                bits 4-7 start requests
  *   INFO   19ed82ae-ed21-4c9d-4145-228e69fe0000  read           [0] = protocol version (2: humanized text)
  */
-#define PHONE_KB_PROTOCOL_VERSION 2
+#define PHONE_KB_PROTOCOL_VERSION 3 // 2: humanized text, 3: stored text (0x0C-0x0E)
 extern const FuriHalBleProfileTemplate* const ble_profile_phone_kb;
 
 #define PHONE_KB_TOKEN_LEN 16
@@ -108,6 +109,7 @@ uint32_t ble_profile_phone_kb_get_release_count(FuriHalBleProfileBase* profile);
 /** Publish PROGRESS (notifies the phone if it subscribed). Call from the app thread. */
 #define PHONE_KB_STATE_CAPS_PAUSED (1 << 0) // paused with Caps Lock on the PC
 #define PHONE_KB_STATE_CAPS_ON     (1 << 1) // Caps Lock is on at the PC
+#define PHONE_KB_STATE_STORED      (1 << 2) // a stored text is ready: Caps Lock types it
 #define PHONE_KB_STATE_START_SHIFT 4 // bits 4-7: counts Caps Lock presses while idle (start request)
 
 /**
