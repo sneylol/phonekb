@@ -503,12 +503,19 @@ function packetCost(p) { return p[0] === OP.TEXT ? p[1] * msPerLetter() : 1; }
 
 let releasePending = false, resumePending = false;
 const RELEASE_OPS = [OP.UP, OP.KUP, OP.RELEASE];
+const STORE_OPS = [OP.STORE_BEGIN, OP.STORE_DATA, OP.STORE_END];
+const INPUT_OPS = [OP.TAP, OP.MOVE, OP.DOWN, OP.UP, OP.SCROLL, OP.RELEASE, OP.CONSUMER, OP.TEXT, OP.KDOWN, OP.KUP, OP.HTEXT];
+const BUSY_HINT = "The Flipper is typing a text: the touchpad and keys are off until it's done (Stop ends it).";
 
 function send(...bytes) {
-  if (paused) {
-    // New input is ignored while paused, but letting go of a held button or key
+  // The stored text isn't input: it's saved on the Flipper (held there while paused)
+  if (STORE_OPS.includes(bytes[0])) { if (connected) { queue.push(bytes); pump(); } return; }
+  if (paused || (flipperRunning && INPUT_OPS.includes(bytes[0]))) {
+    // New input is ignored while paused, or while the Flipper types a saved text by
+    // itself (it would only be done afterwards). Letting go of a held button or key
     // must still work: the Flipper releases everything right away (config flag).
     if (RELEASE_OPS.includes(bytes[0]) && connected) { releasePending = true; pump(); }
+    else if (!paused && connected) showErr(BUSY_HINT);
     return;
   }
   recordBytes(bytes);
@@ -517,7 +524,7 @@ function send(...bytes) {
 }
 
 function flushMotion() {
-  if (flipperBusyMs() > 50) {   // the Flipper is busy typing: a late pointer jump is worse than none
+  if (flipperRunning || flipperBusyMs() > 50) {   // the Flipper is busy typing: a late pointer jump is worse than none
     moveX = moveY = scrollAcc = 0;
     return;
   }
@@ -554,13 +561,14 @@ function setCapsPaused(on) {
 }
 // Pause/Resume buttons: "Resume" while the phone paused, or while the Flipper holds a
 // pause (Caps Lock pause, or one it kept when the phone's connection dropped)
+function flipperHolds() { return capsPaused && flipperVersion >= 5; }   // older apps can't be resumed from here
 function updatePauseButtons() {
-  const held = paused || capsPaused;
+  const held = paused || flipperHolds();
   document.querySelectorAll(".pausebtn").forEach((b) => { b.textContent = held ? "Resume" : "Pause"; b.classList.toggle("on", held); });
 }
 function togglePause() {
   if (!connected) return;
-  if (capsPaused && !paused) { resumePending = true; pump(); return; }   // release the Flipper's pause
+  if (flipperHolds() && !paused) { resumePending = true; pump(); return; }   // release the Flipper's pause
   setPaused(!paused);
 }
 // PROGRESS byte 4: bit 0 paused with Caps Lock, bit 1 Caps Lock on, bits 4-7 count of
@@ -573,10 +581,15 @@ function readProgress(dv) {
   setCapsPaused((st & 1) === 1);
   capsOn = (st & 2) === 2;
   setStoredReady((st & 4) === 4);
+  // The Flipper finished the stored text's last packet but didn't keep it (SD card?)
+  if (storing && storeEndAt && flipperDone >= storeEndAt && !(st & 4)) {
+    storing = false; storeFailed = true; storedText = null; showStoreInfo();
+  }
   const running = (st & 8) === 8;
   if (dv.byteLength >= 6) runsAccepted = dv.getUint8(5);
   if (running !== flipperRunning) {
     flipperRunning = running;
+    if (!running && $("err").textContent === BUSY_HINT) showErr("");
     // (e.g. after reconnecting while the Flipper was typing a text by itself)
     if (connected && !bulkRunning && !paused && !capsPaused)
       setStatus(running ? "The Flipper is typing a text (Stop works)…" : "Connected: " + device.name, true);
@@ -600,7 +613,7 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
 // clipboard, or, if the browser won't give it (or it's empty), the text in the
 // Send text box. Afterwards Caps Lock is put back the way it was before the press.
 async function capsStart() {
-  if (!$("capsClip").checked || !connected || bulkRunning) return;   // while typing, Caps Lock pauses (on the Flipper)
+  if (!$("capsClip").checked || !connected || bulkRunning || playing || flipperRunning) return;   // while typing, Caps Lock pauses (on the Flipper)
   const capsBefore = !capsOn;   // this press flipped it
   let text = "", clipProblem = "";
   try {
@@ -622,6 +635,7 @@ async function capsStart() {
       return;
     }
     showErr("Caps Lock: " + clipProblem + ", so the text from the Send text box is typed.");
+    if (bulkBlocked(text)) { await typeBulk(text, capsBefore); return; }   // shows why, puts Caps Lock back
     markBoxTyped();
   } else {
     showErr("");
@@ -699,7 +713,7 @@ async function pump() {
     for (;;) {
       if (!connected) break;
       if ((delayDirty || stopPending || releasePending || resumePending) && cfgChar) {   // settings use the same one-at-a-time queue
-        const d = typeDelay(), flags = (stopPending ? 1 : 0) | (paused ? 2 : 0) | (releasePending ? 4 : 0) | (resumePending ? 8 : 0);
+        const d = typeDelay(), flags = (stopPending ? 1 : 0) | (paused ? 2 : 0) | (releasePending ? 4 : 0) | (resumePending ? 8 : 0) | (playing ? 16 : 0);
         delayDirty = false; stopPending = false; releasePending = false; resumePending = false;
         try {
           // [3] = PC layout, so the Flipper presses the right keys for y/z, umlauts, symbols
@@ -754,6 +768,7 @@ async function pump() {
       if (!progressChar) backlogMs += cost;
       for (const p of pk) {
         sentBytes += p.length;
+        if (p[0] === OP.STORE_END) storeEndAt = sentBytes;
         if (p[0] === OP.TEXT || p[0] === OP.HTEXT)
           textLog.push({ end: sentBytes, letters: p[1], ms: p[1] * (p[0] === OP.HTEXT ? humanMsPerLetter() : msPerLetter()) });
       }
@@ -915,7 +930,10 @@ function typeDelay() { return DELAY_STEPS[Math.max(0, Math.min(DELAY_STEPS.lengt
 // Kept on the safe side (8 ms), so the page never gets ahead of the Flipper.
 function msPerLetter() { return (cfgChar ? typeDelay() : 2) + 8; }
 // Tell the Flipper to stop typing and drop whatever it still has queued
-function stopTyping() { queue = []; backlogMs = 0; setPaused(false, false); stopPending = true; pump(); }
+function stopTyping() {
+  queue = []; backlogMs = 0; setPaused(false, false); stopPending = true; pump();
+  if (storing) { storing = false; storedText = null; scheduleStore(1500); }   // its packets were dropped: store it again
+}
 
 // Pause: the Flipper holds everything it has queued (mid-text too) until Resume.
 // Sent text and macros wait as well, and new touchpad/keyboard input is ignored.
@@ -932,11 +950,11 @@ async function runningWait(ms, cancelled) {
   while (left > 0 && !cancelled()) {
     await sleep(Math.min(50, Math.max(1, left)));
     const now = performance.now();
-    if (!paused) left -= now - last;
+    if (!paused && !capsPaused) left -= now - last;   // (Caps Lock pause on the Flipper too)
     last = now;
   }
 }
-async function whilePaused(cancelled) { while (paused && !cancelled()) await sleep(50); }
+async function whilePaused(cancelled) { while ((paused || capsPaused) && connected && !cancelled()) await sleep(50); }
 (function () {
   const el = $("typeDelay"), out = $("typeDelayVal");
   try {
@@ -998,9 +1016,21 @@ function checkHumanSupport() {
 let bulkCancel = false;
 let bulkRunning = false;
 $("sendBulk").onclick = () => {
+  const raw = $("bulk").value, why = bulkBlocked(raw);
+  if (why) { showErr(why); return; }   // nothing is typed: the box text stays stored
+  if (paused) setPaused(false);   // first, so clearing the stored copy isn't held back
   markBoxTyped();   // typing it now uses it up: don't (also) leave it stored for Caps Lock
-  typeBulk($("bulk").value);
+  typeBulk(raw);
 };
+// Why a text can't be typed right now ("" = it can)
+function bulkBlocked(raw) {
+  if (bulkRunning) return "Already typing: tap Stop first.";
+  if (!connected) return "Connect to the Flipper first.";
+  if (flipperRunning) return "The Flipper is still typing a text: wait, or tap Stop first.";
+  if (playing) return "A macro is playing: stop it first.";
+  if (!toAscii(raw)) return raw ? "Nothing to type: the Flipper can't type these characters (emoji and the like)." : "There's no text to type.";
+  return "";
+}
 // The box text is being typed: it must not be stored (again) for Caps Lock afterwards
 function markBoxTyped() {
   typedText = $("bulk").value;
@@ -1014,13 +1044,16 @@ function markBoxTyped() {
 // Caps Lock press on the PC makes the Flipper type it by itself, even with the
 // phone locked. It's used once; edit or paste new text to store it again.
 let storeTimer = null, storing = false, storedReady = false, storedText = null, typedText = null;
+let storeEndAt = 0, storeFailed = false;   // sentBytes after the last STORE_END; the Flipper refused it
 const STORE_MAX_CHARS = 20000;
 function storeAvailable() { return connected && flipperVersion >= 3 && $("capsClip").checked; }
 function showStoreInfo() {
   const el = $("storeInfo"), box = $("bulk").value;
   let text = "", ok = false;
   if (connected && flipperVersion >= 3 && $("capsClip").checked && box) {
-    if (storedReady && storedText === box) { text = "✓ Stored on the Flipper: press Caps Lock on the PC to type it (you can lock the phone)"; ok = true; }
+    if (typedText !== box && toAscii(box).length > STORE_MAX_CHARS) text = "Too long to store on the Flipper (over 20,000 characters): tap Send text instead (keep the phone on).";
+    else if (storeFailed && typedText !== box) text = "The Flipper couldn't save the text (SD card?), so Caps Lock can't type it: tap Send text instead.";
+    else if (storedReady && storedText === box) { text = "✓ Stored on the Flipper: press Caps Lock on the PC to type it (you can lock the phone)"; ok = true; }
     else if (typedText === box) text = "Typed on the PC. Edit or paste new text to store it again.";
     else text = "Sending the text to the Flipper…";
   }
@@ -1036,7 +1069,7 @@ function setStoredReady(on) {
 }
 function scheduleStore(ms) { clearTimeout(storeTimer); storeTimer = setTimeout(storeNow, ms); showStoreInfo(); }
 function sendStore(text, human) {
-  storing = true;
+  storing = true; storeEndAt = 0; storeFailed = false;
   send(OP.STORE_BEGIN);
   const bytes = Array.from(new TextEncoder().encode(text));
   for (let i = 0; i < bytes.length; i += TEXT_CHUNK) {
@@ -1051,7 +1084,8 @@ function storeNow() {
   if (!connected || flipperVersion < 3) return;
   if (paused || bulkRunning) { scheduleStore(1500); return; }   // input is held while paused; don't mix with typing
   const box = $("bulk").value;
-  const text = $("capsClip").checked && box !== typedText ? toAscii(box.slice(0, STORE_MAX_CHARS)) : "";
+  let text = $("capsClip").checked && box !== typedText ? toAscii(box) : "";
+  if (text.length > STORE_MAX_CHARS) text = "";   // too long: never store a cut-off text (Send text streams it)
   sendStore(text, humanOn());
   if (!text) storing = false;
   storedText = text ? box : null;
@@ -1071,9 +1105,12 @@ $("clipBulk").onclick = async () => {
 };
 // capsBefore: Caps Lock state before the user's start press (Caps Lock start), else null
 async function typeBulk(raw, capsBefore = null) {
-  if (bulkRunning) { showErr("Already typing: tap Stop first."); return; }
-  if (!connected) { showErr("Connect to the Flipper first."); return; }
-  if (flipperRunning) { showErr("The Flipper is still typing a text: wait, or tap Stop first."); return; }
+  const why = bulkBlocked(raw);
+  if (why) {
+    showErr(why);
+    if (capsBefore !== null) restoreCaps(capsBefore);   // a Caps Lock start that types nothing: undo the press
+    return;
+  }
   if (paused) setPaused(false);   // a new text means "go": nothing is sent while paused
   // Macro recording: one text step (the packets below aren't recorded one by one)
   if (recording && !playing) rec({ t: "text", s: toAscii(raw) });
@@ -1422,7 +1459,9 @@ async function playMacro(name, reps = 1, mark = false) {
   if (recording) stopRec();
   const list = macros[name];
   if (!list || !list.length) { showErr(`"${name}" has no steps yet.`); return; }
+  if (flipperRunning || bulkRunning) { showErr("A text is still being typed: wait, or tap Stop first."); return; }
   showErr(""); clearMods(); playing = true; playingName = name; stopFlag = false; showBar(); renderRemote();
+  delayDirty = true; pump();   // the Flipper: Caps Lock now pauses, it doesn't start a text
   try {
     for (let r = 0; r < reps && !stopFlag; r++) {
       for (let i = 0; i < list.length && !stopFlag && connected; i++) {
@@ -1436,6 +1475,7 @@ async function playMacro(name, reps = 1, mark = false) {
   } finally {
     if (stopFlag && connected) { queue = []; send(OP.RELEASE); }
     playing = false; playingName = null; markStep(-1); showBar(); renderRemote();
+    delayDirty = true; pump();
   }
 }
 function play() { return playMacro(curName, Math.max(1, Math.min(999, +$("mrep").value || 1)), true); }

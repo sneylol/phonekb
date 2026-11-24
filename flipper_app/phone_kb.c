@@ -168,6 +168,8 @@ typedef struct {
     uint32_t usb_up_at; // when it (re)connected: its first Caps Lock report is the PC's state, not a press
     bool phone_held; // the phone's Pause was on while typing (kept if the link drops)
     uint32_t resume_seen; // last "resume" request from the phone handled
+    bool link_seen; // phone link up (last seen by link_watch)
+    uint32_t link_up_at; // when it last came up (or a drop was started)
     bool store_ok; // every part of the stored text was written
 
     // what was last reported to the phone (PROGRESS) and when
@@ -334,8 +336,10 @@ static void caps_check(PhoneKb* app) {
     }
     // Busy = a text is being typed (or a text job / saved text is under way). Not
     // "bytes waiting from the phone": those can be mouse moves or a background upload.
+    // Also busy: a "type now" text still arriving (run_file open), or a macro playing.
     bool busy = app->typing_active || app->caps_paused || app->job_active || app->run_start ||
-                app->run_typing || app->stored_typing;
+                app->run_typing || app->stored_typing || app->run_file != NULL ||
+                ble_profile_phone_kb_is_busy(app->profile);
     if(!busy) {
         if(app->stored_ready) {
             // A stored text is waiting: the Flipper types it by itself (main loop)
@@ -394,7 +398,9 @@ static void publish_state(PhoneKb* app) {
     uint8_t state = (app->caps_paused ? PHONE_KB_STATE_CAPS_PAUSED : 0) |
                     (app->caps_led ? PHONE_KB_STATE_CAPS_ON : 0) |
                     (app->stored_ready ? PHONE_KB_STATE_STORED : 0) |
-                    ((app->run_start || app->run_typing) ? PHONE_KB_STATE_RUNNING : 0) |
+                    ((app->run_start || app->run_typing || app->stored_typing) ?
+                         PHONE_KB_STATE_RUNNING :
+                         0) |
                     (uint8_t)((app->start_requests & 0x0F) << PHONE_KB_STATE_START_SHIFT);
     app->published_at = furi_get_tick();
     if(progress != app->published_progress || state != app->published_state ||
@@ -420,14 +426,42 @@ static void check_resume_request(PhoneKb* app) {
     }
 }
 
+static void check_release_request(PhoneKb* app);
+
+// Track the phone link and drop one that doesn't present the right secret in
+// time. Called by the main loop and, while a saved text is typed, by the typing loop.
+static void link_watch(PhoneKb* app, PhoneKbAuthStatus auth) {
+    bool up = ble_profile_phone_kb_is_connected(app->profile);
+    if(up != app->link_seen) {
+        app->link_seen = up;
+        app->link_up_at = furi_get_tick();
+    }
+    if(!up) return;
+    uint32_t up_for = furi_get_tick() - app->link_up_at;
+    bool drop = (auth == PhoneKbAuthWaiting && up_for > AUTH_TIMEOUT_MS) ||
+                (auth == PhoneKbAuthRejected && up_for > REJECTED_LINGER_MS);
+    if(drop) {
+        event_log(
+            "dropping phone link: %s", auth == PhoneKbAuthRejected ? "wrong key" : "no key sent");
+        bt_disconnect(app->bt);
+        furi_delay_ms(200);
+        furi_hal_bt_start_advertising();
+        app->link_up_at = furi_get_tick();
+    }
+}
+
 // Checked between letters (and every 10 ms of a letter pause): stop typing when
 // the phone taps Stop, the phone disconnects, or Back is pressed on the Flipper.
 static bool typing_should_stop(PhoneKb* app) {
     caps_check(app);
     check_resume_request(app);
+    check_release_request(app); // e.g. "Hold click" turned off on the phone meanwhile
     if(furi_get_tick() - app->published_at >= 250) {
         publish_state(app);
-        ble_profile_phone_kb_sync_status(app->profile); // key check result after a reconnect
+        // key check result after a reconnect; drop a link that never sends the key
+        link_watch(app, ble_profile_phone_kb_sync_status(app->profile));
+        bool up = ble_profile_phone_kb_is_connected(app->profile);
+        if(app->stored_typing && up != app->ble_connected) phone_kb_link_changed(app, up);
     }
     uint32_t stops = ble_profile_phone_kb_get_stop_count(app->profile);
     if(stops != app->stop_seen) {
@@ -505,6 +539,8 @@ static bool wait_while_paused(PhoneKb* app) {
         check_release_request(app);
         if(typing_should_stop(app)) return false;
     }
+    // Stop tapped while paused (it also ends the pause): not one more letter
+    if(waited && typing_should_stop(app)) return false;
     // Resumed (e.g. with Caps Lock): make sure Caps Lock is off before typing on
     if(waited && caps_lock_on()) ensure_caps_off(app, 350);
     return true;
@@ -767,6 +803,7 @@ static bool type_file(PhoneKb* app, const char* path, bool human, bool caps_befo
     }
     app->stored_typing = true;
     app->typing_active = true;
+    app->phone_held = false; // a pause left over from earlier typing doesn't count
     app->utf8_left = 0;
     humanize_reset(&app->hum);
     app->prev_hold = 0;
@@ -999,6 +1036,7 @@ static void clear_queue(PhoneKb* app, bool was_typing) {
     humanize_reset(&app->hum);
     app->prev_hold = 0;
     app->caps_paused = false; // Stop also ends a Caps Lock pause
+    app->phone_held = false;
     app->typing_active = false;
     uint8_t junk[64];
     size_t dropped = 0, got;
@@ -1017,6 +1055,25 @@ static void clear_queue(PhoneKb* app, bool was_typing) {
     }
     if(was_typing || dropped) {
         event_log("typing stopped, %lu queued bytes dropped", (unsigned long)dropped);
+    }
+}
+
+// The phone's link dropped while a "type now" text was arriving: the rest of it
+// may already be here (the phone keeps up to 1 KB in flight). Save what arrived;
+// if its end is there, the text is typed as usual. Nothing else is executed.
+static void finish_upload(PhoneKb* app) {
+    uint8_t buf[CHUNK_SIZE];
+    size_t n;
+    while(app->run_file && (n = furi_stream_buffer_receive(app->rx, buf, sizeof(buf), 0)) > 0) {
+        for(size_t i = 0; i < n; i++) {
+            app->pkt[app->pkt_len++] = buf[i];
+            if(app->pkt_len >= packet_length(app->pkt, app->pkt_len)) {
+                if(app->pkt[0] == OpRunData || app->pkt[0] == OpRunEnd)
+                    execute_packet(app, app->pkt);
+                app->pkt_len = 0;
+            }
+        }
+        app->bytes_done += n;
     }
 }
 
@@ -1133,7 +1190,6 @@ int32_t phone_kb_app(void* p) {
     PhoneKbAuthStatus shown_auth = PhoneKbAuthWaiting;
     bool shown_connected = false;
     bool shown_paused = false;
-    uint32_t link_up_at = 0;
     uint8_t logged_leds = 0xFF;
     uint32_t logged_dropped = 0;
     while(running) {
@@ -1206,25 +1262,19 @@ int32_t phone_kb_app(void* p) {
             shown_connected = ble_connected;
             phone_kb_link_changed(app, ble_connected);
             event_log("phone %s", ble_connected ? "connected" : "disconnected");
-            // Don't keep typing for a phone that's gone
-            if(!ble_connected) clear_queue(app, false);
-            link_up_at = furi_get_tick();
+            if(!ble_connected) {
+                // A "type now" text that arrived completely is still typed
+                finish_upload(app);
+                bool received = app->run_start;
+                // Don't keep typing anything else for a phone that's gone
+                clear_queue(app, false);
+                app->run_start = received;
+                if(received) event_log("phone gone, but its text arrived completely: typing it");
+            }
         }
 
         // Drop a link that doesn't present the right secret in time
-        if(ble_connected) {
-            uint32_t up_for = furi_get_tick() - link_up_at;
-            bool drop = (auth == PhoneKbAuthWaiting && up_for > AUTH_TIMEOUT_MS) ||
-                        (auth == PhoneKbAuthRejected && up_for > REJECTED_LINGER_MS);
-            if(drop) {
-                event_log(
-                    "dropping phone link: %s", auth == PhoneKbAuthRejected ? "wrong key" : "no key sent");
-                bt_disconnect(app->bt);
-                furi_delay_ms(200);
-                furi_hal_bt_start_advertising();
-                link_up_at = furi_get_tick();
-            }
-        }
+        link_watch(app, auth);
 
         uint32_t dropped = app->rx_dropped;
         if(dropped != logged_dropped) {

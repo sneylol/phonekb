@@ -27,6 +27,8 @@ extern "C" {
  *                                                                [2] bit 2 = release all keys/buttons now
  *                                                                [2] bit 3 = resume a pause held by the Flipper
  *                                                                (Caps Lock pause, or kept after a drop)
+ *                                                                [2] bit 4 = the phone is playing a macro
+ *                                                                (Caps Lock pauses it, doesn't start a text)
  *                                                                [3] = PC keyboard layout (PhoneKbLayout)
  *                                                                [4] bit 1 = humanized text makes typos
  *                                                                [4] bits 2-3 = thinking pauses 0 off..3 heavy
@@ -37,7 +39,8 @@ extern "C" {
  *                                                                the 2 KB buffer never overflows or runs dry.
  *                                                                [4] = state: bit 0 paused with Caps Lock,
  *                                                                bit 1 Caps Lock on, bit 2 stored text ready,
- *                                                                bit 3 "type now" text received / typing,
+ *                                                                bit 3 a saved text ("type now" or stored)
+ *                                                                is about to be typed / being typed,
  *                                                                [5] = "type now" texts accepted (counter)
  *                                                                bits 4-7 start requests
  *   INFO   19ed82ae-ed21-4c9d-4145-228e69fe0000  read           [0] = protocol version (2: humanized text)
@@ -115,7 +118,7 @@ uint32_t ble_profile_phone_kb_get_release_count(FuriHalBleProfileBase* profile);
 #define PHONE_KB_STATE_CAPS_PAUSED (1 << 0) // paused with Caps Lock on the PC
 #define PHONE_KB_STATE_CAPS_ON     (1 << 1) // Caps Lock is on at the PC
 #define PHONE_KB_STATE_STORED      (1 << 2) // a stored text is ready: Caps Lock types it
-#define PHONE_KB_STATE_RUNNING     (1 << 3) // a "type now" text was received and is being typed
+#define PHONE_KB_STATE_RUNNING     (1 << 3) // a saved text is about to be / being typed
 #define PHONE_KB_STATE_START_SHIFT 4 // bits 4-7: counts Caps Lock presses while idle (start request)
 
 /**
@@ -130,6 +133,9 @@ void ble_profile_phone_kb_publish_progress(
 
 /** Increments each time the phone asks to resume a pause held by the Flipper (CONFIG [2] bit 3). */
 uint32_t ble_profile_phone_kb_get_resume_count(FuriHalBleProfileBase* profile);
+
+/** True while the phone plays a macro (CONFIG [2] bit 4). Cleared on disconnect. */
+bool ble_profile_phone_kb_is_busy(FuriHalBleProfileBase* profile);
 
 /** Increments each time the phone asks to stop typing (CONFIG [2] bit 0). */
 uint32_t ble_profile_phone_kb_get_stop_count(FuriHalBleProfileBase* profile);

@@ -131,6 +131,7 @@ typedef struct {
     volatile uint32_t release_count;
     volatile uint32_t resume_count;
     volatile bool paused;
+    volatile bool busy; // the phone is playing a macro
     volatile uint8_t layout;
     volatile uint8_t wpm;
     volatile bool typos;
@@ -161,6 +162,7 @@ static BleEventAckStatus phone_kb_event_handler(void* event, void* context) {
         p->auth = PhoneKbAuthWaiting;
         p->link_up = false;
         p->paused = false;
+        p->busy = false;
         return BleEventNotAck;
     }
     if(event_pckt->evt == HCI_LE_META_EVT_CODE &&
@@ -209,6 +211,7 @@ static BleEventAckStatus phone_kb_event_handler(void* event, void* context) {
                 if(mod->Attr_Data[2] & 4) p->release_count++;
                 if(mod->Attr_Data[2] & 8) p->resume_count++;
                 p->paused = (mod->Attr_Data[2] & 2) != 0;
+                p->busy = (mod->Attr_Data[2] & 16) != 0;
             }
             if(mod->Attr_Data_Length >= 4) p->layout = mod->Attr_Data[3];
             if(mod->Attr_Data_Length >= 6) {
@@ -411,4 +414,9 @@ uint8_t ble_profile_phone_kb_get_think(FuriHalBleProfileBase* profile) {
 uint32_t ble_profile_phone_kb_get_resume_count(FuriHalBleProfileBase* profile) {
     furi_check(profile && (profile->config == ble_profile_phone_kb));
     return ((BleProfilePhoneKb*)profile)->resume_count;
+}
+
+bool ble_profile_phone_kb_is_busy(FuriHalBleProfileBase* profile) {
+    furi_check(profile);
+    return ((BleProfilePhoneKb*)profile)->busy;
 }

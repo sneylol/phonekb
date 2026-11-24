@@ -450,6 +450,11 @@ static void hid_deinit(usbd_device* dev) {
     usbd_reg_config(dev, NULL);
     usbd_reg_control(dev, NULL);
     hid_connected = false;
+    // A static of this app: a new one is made on every launch, so free it here
+    if(hid_semaphore != NULL) {
+        furi_semaphore_free(hid_semaphore);
+        hid_semaphore = NULL;
+    }
 
     free(pkb_usb_hid.str_manuf_descr);
     free(pkb_usb_hid.str_prod_descr);
