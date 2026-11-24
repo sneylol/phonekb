@@ -27,6 +27,7 @@ The computer needs **no drivers, no software and no Bluetooth**. It just sees a 
 - **Remote:** sort macros into groups (e.g. Work, Gaming) and get a page of big buttons, one tap per macro
 - **Send a block of text:** paste a paragraph on the phone and have it typed out on the PC
 - **Works offline:** install it from Chrome and it runs with no internet
+- **Caps Lock pauses typing (Momentum mntm-012 build):** while the Flipper is typing, press Caps Lock on the PC to pause, press it again to continue. Works on Windows and Linux. On a Mac, a press on the Mac's own keyboard isn't passed on to other keyboards, so use the Pause button on the phone there. (The app brings its own USB keyboard for this: Momentum's can't receive the Caps Lock state.)
 - **No pairing codes (Momentum mntm-012 build):** the page keeps a random secret key and the Flipper only accepts the first phone that connects, so other nearby devices can't type on your PC. The link isn't Bluetooth-encrypted, so someone sniffing Bluetooth nearby could read what you type. The other `.fap` builds still use a 6-digit PIN.
 
 ## Requirements

@@ -41,6 +41,7 @@
 #include "phone_kb_profile.h"
 #include "layout_de.h"
 #include "humanize.h"
+#include "phone_kb_usb.h"
 
 #define TAG              "PhoneKB"
 #define KEYS_PATH        APP_DATA_PATH(".phone_kb.keys")
@@ -226,10 +227,10 @@ static void phone_kb_link_changed(PhoneKb* app, bool connected) {
     } else {
         notification_internal_message(app->notifications, &sequence_reset_blue);
         // Don't leave keys or buttons stuck down on the PC
-        furi_hal_hid_kb_release_all();
-        furi_hal_hid_mouse_release(HID_MOUSE_BTN_LEFT);
-        furi_hal_hid_mouse_release(HID_MOUSE_BTN_RIGHT);
-        furi_hal_hid_mouse_release(HID_MOUSE_BTN_WHEEL);
+        pkb_hid_kb_release_all();
+        pkb_hid_mouse_release(HID_MOUSE_BTN_LEFT);
+        pkb_hid_mouse_release(HID_MOUSE_BTN_RIGHT);
+        pkb_hid_mouse_release(HID_MOUSE_BTN_WHEEL);
     }
     view_port_update(app->view_port);
 }
@@ -241,7 +242,7 @@ static void phone_kb_link_changed(PhoneKb* app, bool connected) {
 // While the Flipper is typing, or has text waiting, each Caps Lock press pauses
 // or resumes it. When it's idle, Caps Lock is just Caps Lock.
 static bool caps_lock_on(void) {
-    return (furi_hal_hid_get_led_state() & HID_KB_LED_CAPS) != 0;
+    return (pkb_hid_get_led_state() & HID_KB_LED_CAPS) != 0;
 }
 
 static void caps_check(PhoneKb* app) {
@@ -250,8 +251,12 @@ static void caps_check(PhoneKb* app) {
     app->caps_led = on;
     bool busy = app->typing_active || app->caps_paused ||
                 furi_stream_buffer_bytes_available(app->rx) > 0;
-    if(!busy || ble_profile_phone_kb_is_paused(app->profile)) return; // phone's Pause rules
+    if(!busy || ble_profile_phone_kb_is_paused(app->profile)) { // idle, or the phone's Pause rules
+        event_log("Caps Lock %s (not typing: ignored)", on ? "on" : "off");
+        return;
+    }
     app->caps_paused = !app->caps_paused;
+    event_log("Caps Lock %s: %s", on ? "on" : "off", app->caps_paused ? "PAUSED" : "resumed");
     view_port_update(app->view_port);
 }
 
@@ -299,11 +304,11 @@ static bool letter_pause(PhoneKb* app) {
 
 static void release_everything(PhoneKb* app) {
     UNUSED(app);
-    furi_hal_hid_kb_release_all();
-    furi_hal_hid_consumer_key_release_all();
-    furi_hal_hid_mouse_release(HID_MOUSE_BTN_LEFT);
-    furi_hal_hid_mouse_release(HID_MOUSE_BTN_RIGHT);
-    furi_hal_hid_mouse_release(HID_MOUSE_BTN_WHEEL);
+    pkb_hid_kb_release_all();
+    pkb_hid_consumer_key_release_all();
+    pkb_hid_mouse_release(HID_MOUSE_BTN_LEFT);
+    pkb_hid_mouse_release(HID_MOUSE_BTN_RIGHT);
+    pkb_hid_mouse_release(HID_MOUSE_BTN_WHEEL);
 }
 
 // The phone can ask to let go of held keys/buttons even while paused (when the
@@ -410,12 +415,12 @@ static bool type_codepoint(PhoneKb* app, uint32_t cp) {
     if(key == HID_KEYBOARD_NONE) return true; // can't be typed on this layout: skip it
     app->prev_hold = 0;
 
-    furi_hal_hid_kb_press(key);
-    furi_hal_hid_kb_release(key);
+    pkb_hid_kb_press(key);
+    pkb_hid_kb_release(key);
     if(dead) {
         // Dead key (^ ´ `): Space makes it type the accent itself
-        furi_hal_hid_kb_press(HID_KEYBOARD_SPACEBAR);
-        furi_hal_hid_kb_release(HID_KEYBOARD_SPACEBAR);
+        pkb_hid_kb_press(HID_KEYBOARD_SPACEBAR);
+        pkb_hid_kb_release(HID_KEYBOARD_SPACEBAR);
     }
     app->keys_sent++;
     remember_char(app, cp);
@@ -465,14 +470,14 @@ static bool hum_key(PhoneKb* app, uint32_t cp, uint32_t gap) {
         return true;
     }
     uint32_t hold = humanize_hold_ms(&app->hum, gap);
-    furi_hal_hid_kb_press(key);
+    pkb_hid_kb_press(key);
     furi_delay_ms(hold);
-    furi_hal_hid_kb_release(key);
+    pkb_hid_kb_release(key);
     if(dead) { // Space after a dead key, a quick second press
         furi_delay_ms(40 + hold / 2);
-        furi_hal_hid_kb_press(HID_KEYBOARD_SPACEBAR);
+        pkb_hid_kb_press(HID_KEYBOARD_SPACEBAR);
         furi_delay_ms(hold * 3 / 4);
-        furi_hal_hid_kb_release(HID_KEYBOARD_SPACEBAR);
+        pkb_hid_kb_release(HID_KEYBOARD_SPACEBAR);
     }
     app->prev_hold = hold;
     app->keys_sent++;
@@ -554,36 +559,36 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
     switch(p[0]) {
     case OpTap: {
         uint16_t key = ((uint16_t)p[1] << 8) | p[2];
-        furi_hal_hid_kb_press(key);
-        furi_hal_hid_kb_release(key);
+        pkb_hid_kb_press(key);
+        pkb_hid_kb_release(key);
         app->keys_sent++;
         break;
     }
     case OpKeyDown:
-        furi_hal_hid_kb_press(((uint16_t)p[1] << 8) | p[2]);
+        pkb_hid_kb_press(((uint16_t)p[1] << 8) | p[2]);
         break;
     case OpKeyUp:
-        furi_hal_hid_kb_release(((uint16_t)p[1] << 8) | p[2]);
+        pkb_hid_kb_release(((uint16_t)p[1] << 8) | p[2]);
         break;
     case OpMouseMove:
-        furi_hal_hid_mouse_move((int8_t)p[1], (int8_t)p[2]);
+        pkb_hid_mouse_move((int8_t)p[1], (int8_t)p[2]);
         break;
     case OpMouseDown:
-        furi_hal_hid_mouse_press(p[1]);
+        pkb_hid_mouse_press(p[1]);
         break;
     case OpMouseUp:
-        furi_hal_hid_mouse_release(p[1]);
+        pkb_hid_mouse_release(p[1]);
         break;
     case OpScroll:
-        furi_hal_hid_mouse_scroll((int8_t)p[1]);
+        pkb_hid_mouse_scroll((int8_t)p[1]);
         break;
     case OpReleaseAll:
         release_everything(app);
         break;
     case OpConsumer: {
         uint16_t key = p[1] | ((uint16_t)p[2] << 8);
-        furi_hal_hid_consumer_key_press(key);
-        furi_hal_hid_consumer_key_release(key);
+        pkb_hid_consumer_key_press(key);
+        pkb_hid_consumer_key_release(key);
         break;
     }
     case OpText: {
@@ -674,7 +679,7 @@ static void draw_cb(Canvas* canvas, void* context) {
     }
     canvas_draw_str(canvas, 2, 24, phone);
     canvas_draw_str(
-        canvas, 2, 35, furi_hal_hid_is_connected() ? "PC (USB): connected" : "PC (USB): plug in cable");
+        canvas, 2, 35, pkb_hid_is_connected() ? "PC (USB): connected" : "PC (USB): plug in cable");
 
     char buf[32];
     snprintf(buf, sizeof(buf), "Keys sent: %lu", app->keys_sent);
@@ -704,10 +709,11 @@ int32_t phone_kb_app(void* p) {
     app->gui = furi_record_open(RECORD_GUI);
     gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
 
-    // USB: become a keyboard + mouse (this disconnects qFlipper while running)
+    // USB: become a keyboard + mouse (this disconnects qFlipper while running).
+    // Our own copy of the firmware's keyboard, which can also receive Caps Lock.
     app->usb_prev = furi_hal_usb_get_config();
     furi_hal_usb_unlock();
-    furi_check(furi_hal_usb_set_config(&usb_hid, NULL));
+    furi_check(furi_hal_usb_set_config(&pkb_usb_hid, NULL));
 
     humanize_init(&app->hum, hum_random, NULL);
     app->caps_led = caps_lock_on();
@@ -733,6 +739,7 @@ int32_t phone_kb_app(void* p) {
     bool shown_paused = false;
     uint32_t link_up_at = 0;
     uint32_t published_progress = 0;
+    uint8_t logged_leds = 0xFF;
     uint8_t published_state = 0;
     uint32_t logged_dropped = 0;
     while(running) {
@@ -825,9 +832,19 @@ int32_t phone_kb_app(void* p) {
             event_log("rx buffer full, %lu bytes dropped so far", (unsigned long)dropped);
         }
 
-        bool usb_connected = furi_hal_hid_is_connected();
+        uint8_t leds = pkb_hid_get_led_state();
+        if(logged_leds == 0xFF || ((leds ^ logged_leds) & HID_KB_LED_NUM)) {
+            logged_leds = leds;
+            event_log(
+                "PC keyboard lights: caps %s, num %s",
+                (leds & HID_KB_LED_CAPS) ? "on" : "off",
+                (leds & HID_KB_LED_NUM) ? "on" : "off");
+        }
+
+        bool usb_connected = pkb_hid_is_connected();
         if(usb_connected != usb_was_connected) {
             usb_was_connected = usb_connected;
+            event_log("PC (USB) %s", usb_connected ? "active" : "suspended/unplugged");
             view_port_update(app->view_port);
         }
 
@@ -860,7 +877,7 @@ int32_t phone_kb_app(void* p) {
     furi_check(bt_profile_restore_default(app->bt));
     furi_record_close(RECORD_BT);
 
-    furi_hal_hid_kb_release_all();
+    pkb_hid_kb_release_all();
     furi_hal_usb_set_config(app->usb_prev, NULL);
 
     notification_internal_message(app->notifications, &sequence_reset_blue);
