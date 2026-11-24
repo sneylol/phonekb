@@ -26,6 +26,10 @@
  *                        rhythm and pauses at the CONFIG speed, optional typos
  *   0x0C                 stored text: start a new one (clears the old)
  *   0x0D len bytes...    stored text: more UTF-8 text (saved to the SD card)
+ *   0x0F flags           text job begins (Send text, Clipboard, a macro's text): Caps Lock
+ *                        is switched off for typing and restored at the end. flags bit 0:
+ *                        "state before" given in bit 1 (Caps Lock start), else read now
+ *   0x10                 text job ends: Caps Lock back to how it was
  *   0x0E flags           stored text: done (flags bit 0: humanized). From now on a
  *                        Caps Lock press on the PC while idle makes the Flipper type
  *                        it by itself, even with the phone locked or disconnected.
@@ -78,6 +82,8 @@ typedef enum {
     OpStoreBegin = 0x0C,
     OpStoreData = 0x0D,
     OpStoreEnd = 0x0E,
+    OpJobBegin = 0x0F,
+    OpJobEnd = 0x10,
 } Op;
 
 typedef struct {
@@ -125,6 +131,8 @@ typedef struct {
     bool typing_active; // in the middle of typing a text packet
     uint8_t start_requests; // Caps Lock presses while idle: the phone starts typing its clipboard
     uint32_t start_request_tick; // when the last start request was made (0 = none pending)
+    bool job_active; // a text job from the phone is running (0x0F .. 0x10)
+    bool job_caps_before; // Caps Lock state to restore when it ends
 
     // Stored text (sent by the phone in advance): typed on Caps Lock without the phone
     Storage* storage;
@@ -319,9 +327,9 @@ static void press_own_caps(PhoneKb* app) {
 // (, -> ;  ( -> 8  ? -> ß), not just letters. Waits a moment first, because the
 // user's own Caps Lock key may still be held down, and while it is, the PC
 // ignores a second Caps Lock press. Then checks the PC really switched it off.
-static void ensure_caps_off(PhoneKb* app) {
+static void ensure_caps_off(PhoneKb* app, uint32_t first_wait_ms) {
     for(int attempt = 0; attempt < 3 && caps_lock_on(); attempt++) {
-        furi_delay_ms(attempt == 0 ? 350 : 250);
+        furi_delay_ms(attempt == 0 ? first_wait_ms : 250);
         if(!caps_lock_on()) break;
         press_own_caps(app);
         for(int w = 0; w < 50 && caps_lock_on(); w++) furi_delay_ms(10); // the PC's answer
@@ -396,7 +404,7 @@ static bool wait_while_paused(PhoneKb* app) {
         if(typing_should_stop(app)) return false;
     }
     // Resumed (e.g. with Caps Lock): make sure Caps Lock is off before typing on
-    if(waited && caps_lock_on()) ensure_caps_off(app);
+    if(waited && caps_lock_on()) ensure_caps_off(app, 350);
     return true;
 }
 
@@ -621,8 +629,10 @@ static uint16_t packet_length(const uint8_t* p, uint16_t have) {
     case OpStoreData:
         return (have < 2) ? 0xFFFF : (uint16_t)(2 + p[1]);
     case OpStoreBegin:
+    case OpJobEnd:
         return 1;
     case OpStoreEnd:
+    case OpJobBegin:
         return 2;
     default:
         return 1; // unknown byte: skip it to resync
@@ -658,7 +668,7 @@ static void stored_type(PhoneKb* app) {
     view_port_update(app->view_port);
 
     // Type with Caps Lock off: with it on, some systems change more than letters (ß -> ?)
-    ensure_caps_off(app);
+    ensure_caps_off(app, 350);
 
     bool ok = true;
     uint8_t buf[64];
@@ -690,13 +700,23 @@ static void stored_type(PhoneKb* app) {
     view_port_update(app->view_port);
 }
 
+// End of a text job (or Stop / disconnect during one): Caps Lock back to how it was
+static void job_restore(PhoneKb* app) {
+    if(!app->job_active) return;
+    app->job_active = false;
+    if(caps_lock_on() != app->job_caps_before) {
+        press_own_caps(app);
+        for(int w = 0; w < 30 && caps_lock_on() != app->job_caps_before; w++) furi_delay_ms(10);
+    }
+}
+
 // First text after a Caps Lock start request (the phone types its clipboard or box):
 // make sure Caps Lock is off, whatever the phone managed to do about it.
 static void caps_start_check(PhoneKb* app) {
     if(!app->start_request_tick) return;
     bool recent = furi_get_tick() - app->start_request_tick < 15000;
     app->start_request_tick = 0;
-    if(recent && caps_lock_on()) ensure_caps_off(app);
+    if(recent && caps_lock_on()) ensure_caps_off(app, 350);
 }
 
 static void execute_packet(PhoneKb* app, const uint8_t* p) {
@@ -759,6 +779,17 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
         app->typing_active = false;
         view_port_update(app->view_port);
         break;
+    case OpJobBegin:
+        // Remember Caps Lock (or take the state the phone says it had before the
+        // user's start press), then type with it off
+        app->job_caps_before = (p[1] & 1) ? ((p[1] & 2) != 0) : caps_lock_on();
+        app->job_active = true;
+        app->start_request_tick = 0;
+        ensure_caps_off(app, 50);
+        break;
+    case OpJobEnd:
+        job_restore(app);
+        break;
     case OpStoreBegin:
         stored_clear(app);
         app->store_file = storage_file_alloc(app->storage);
@@ -809,6 +840,7 @@ static void clear_queue(PhoneKb* app, bool was_typing) {
     }
     app->bytes_done += dropped;
     release_everything(app);
+    job_restore(app); // a text job that was cut off: Caps Lock back to how it was
     if(was_typing || dropped) {
         event_log("typing stopped, %lu queued bytes dropped", (unsigned long)dropped);
     }

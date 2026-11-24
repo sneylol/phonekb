@@ -38,7 +38,7 @@ extern "C" {
  *                                                                bits 4-7 start requests
  *   INFO   19ed82ae-ed21-4c9d-4145-228e69fe0000  read           [0] = protocol version (2: humanized text)
  */
-#define PHONE_KB_PROTOCOL_VERSION 3 // 2: humanized text, 3: stored text (0x0C-0x0E)
+#define PHONE_KB_PROTOCOL_VERSION 4 // 2: humanized text, 3: stored text (0x0C-0x0E), 4: text jobs (0x0F, 0x10)
 extern const FuriHalBleProfileTemplate* const ble_profile_phone_kb;
 
 #define PHONE_KB_TOKEN_LEN 16

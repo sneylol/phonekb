@@ -322,7 +322,7 @@ function getSecret() {
 
 // ---- protocol opcodes (must match phone_kb.c) ----
 const OP = { TAP: 1, MOVE: 2, DOWN: 3, UP: 4, SCROLL: 5, RELEASE: 6, CONSUMER: 7, TEXT: 8, KDOWN: 9, KUP: 10, HTEXT: 11,
-             STORE_BEGIN: 12, STORE_DATA: 13, STORE_END: 14 };
+             STORE_BEGIN: 12, STORE_DATA: 13, STORE_END: 14, JOB_BEGIN: 15, JOB_END: 16 };
 const KEY = { ENTER: 0x28, BKSP: 0x2A, TAB: 0x2B, SPACE: 0x2C };
 
 const $ = (id) => document.getElementById(id);
@@ -606,8 +606,8 @@ async function capsStart() {
   // Typing happens with Caps Lock OFF (with it on, some PCs shift every key: , -> ;
   // ß -> ?). The Flipper switches it off itself before the first letter and checks
   // that the PC really did (the user's key may still be held down at this moment).
-  await typeBulk(text);
-  restoreCaps(capsBefore);   // back to how it was before the press
+  await typeBulk(text, capsBefore);   // the Flipper restores Caps Lock to capsBefore at the end
+  if (!jobsSupported()) restoreCaps(capsBefore);   // (older Flipper app: the page does it)
 }
 (function () {   // remember the "Caps Lock types clipboard" switch on this phone
   const el = $("capsClip");
@@ -1040,12 +1040,24 @@ $("clipBulk").onclick = async () => {
   showErr("");
   typeBulk(text);
 };
-async function typeBulk(raw) {
+// capsBefore: Caps Lock state before the user's start press (Caps Lock start), else null
+async function typeBulk(raw, capsBefore = null) {
   if (bulkRunning) { showErr("Already typing: tap Stop first."); return; }
   if (!connected) { showErr("Connect to the Flipper first."); return; }
   bulkRunning = true;
-  try { await typeBulkNow(raw); } finally { bulkRunning = false; }
+  jobBegin(capsBefore);
+  try { await typeBulkNow(raw); } finally { jobEnd(); bulkRunning = false; }
 }
+
+// A "text job" (Send text, Clipboard, a macro's text): the Flipper switches Caps Lock
+// off for typing (with it on, some PCs shift every key: , -> ;  ß -> ?) and puts it
+// back the way it was at the end, also after Stop or a lost connection.
+function jobsSupported() { return connected && flipperVersion >= 4; }
+function jobBegin(capsBefore = null) {
+  if (!jobsSupported()) return;
+  send(OP.JOB_BEGIN, capsBefore === null ? 0 : (1 | (capsBefore ? 2 : 0)));
+}
+function jobEnd() { if (jobsSupported()) send(OP.JOB_END); }
 async function typeBulkNow(raw) {
   const text = toAscii(raw);
   bulkCancel = false;
@@ -1280,15 +1292,18 @@ async function runStep(s) {
   switch (s.t) {
     case "text": {
       const t = toAscii(s.s || "");
+      let job = false;
       for (let i = 0; i < t.length && !stopFlag; i += 100) {
         const part = t.slice(i, i + 100);
         await whilePaused(() => stopFlag);
         if (stopFlag) break;
+        if (!job) { jobBegin(); job = true; }   // Caps Lock off while this text is typed
         typeText(part, true); await waitIdle();
         // let the Flipper finish typing before the next step
         if (progressChar) await waitFlipperDone(() => stopFlag);
         else await wait(part.length * msPerLetter() + 30);
       }
+      if (job) jobEnd();
       break;
     }
     case "key": {
