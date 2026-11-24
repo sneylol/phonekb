@@ -322,7 +322,8 @@ function getSecret() {
 
 // ---- protocol opcodes (must match phone_kb.c) ----
 const OP = { TAP: 1, MOVE: 2, DOWN: 3, UP: 4, SCROLL: 5, RELEASE: 6, CONSUMER: 7, TEXT: 8, KDOWN: 9, KUP: 10, HTEXT: 11,
-             STORE_BEGIN: 12, STORE_DATA: 13, STORE_END: 14, JOB_BEGIN: 15, JOB_END: 16 };
+             STORE_BEGIN: 12, STORE_DATA: 13, STORE_END: 14, JOB_BEGIN: 15, JOB_END: 16,
+             RUN_BEGIN: 17, RUN_DATA: 18, RUN_END: 19 };
 const KEY = { ENTER: 0x28, BKSP: 0x2A, TAB: 0x2B, SPACE: 0x2C };
 
 const $ = (id) => document.getElementById(id);
@@ -500,7 +501,7 @@ function backlog() {
 }
 function packetCost(p) { return p[0] === OP.TEXT ? p[1] * msPerLetter() : 1; }
 
-let releasePending = false;
+let releasePending = false, resumePending = false;
 const RELEASE_OPS = [OP.UP, OP.KUP, OP.RELEASE];
 
 function send(...bytes) {
@@ -547,18 +548,39 @@ let capsPaused = false;   // (declared before readProgress uses it)
 function setCapsPaused(on) {
   if (on === capsPaused) return;
   capsPaused = on;
-  if (on) setStatus("Paused with Caps Lock on the PC: press Caps Lock again to continue", connected);
+  updatePauseButtons();
+  if (on) setStatus("Paused on the Flipper: press Caps Lock on the PC or tap Resume to continue", connected);
   else if (connected && !paused) setStatus("Connected: " + device.name, true);
+}
+// Pause/Resume buttons: "Resume" while the phone paused, or while the Flipper holds a
+// pause (Caps Lock pause, or one it kept when the phone's connection dropped)
+function updatePauseButtons() {
+  const held = paused || capsPaused;
+  document.querySelectorAll(".pausebtn").forEach((b) => { b.textContent = held ? "Resume" : "Pause"; b.classList.toggle("on", held); });
+}
+function togglePause() {
+  if (!connected) return;
+  if (capsPaused && !paused) { resumePending = true; pump(); return; }   // release the Flipper's pause
+  setPaused(!paused);
 }
 // PROGRESS byte 4: bit 0 paused with Caps Lock, bit 1 Caps Lock on, bits 4-7 count of
 // Caps Lock presses while the Flipper was idle ("start typing the clipboard")
 let capsOn = false, lastStartCount = null;
+let flipperRunning = false, runsAccepted = 0;   // "type now" text: being typed / how many accepted
 function readProgress(dv) {
   setProgress(dv.getUint32(0, true));
   const st = dv.byteLength >= 5 ? dv.getUint8(4) : 0;
   setCapsPaused((st & 1) === 1);
   capsOn = (st & 2) === 2;
   setStoredReady((st & 4) === 4);
+  const running = (st & 8) === 8;
+  if (dv.byteLength >= 6) runsAccepted = dv.getUint8(5);
+  if (running !== flipperRunning) {
+    flipperRunning = running;
+    // (e.g. after reconnecting while the Flipper was typing a text by itself)
+    if (connected && !bulkRunning && !paused && !capsPaused)
+      setStatus(running ? "The Flipper is typing a text (Stop works)…" : "Connected: " + device.name, true);
+  }
   const count = st >> 4;
   if (dv.byteLength < 5) return;
   if (lastStartCount === null || document.visibilityState !== "visible") {
@@ -600,6 +622,7 @@ async function capsStart() {
       return;
     }
     showErr("Caps Lock: " + clipProblem + ", so the text from the Send text box is typed.");
+    markBoxTyped();
   } else {
     showErr("");
   }
@@ -675,16 +698,16 @@ async function pump() {
   try {
     for (;;) {
       if (!connected) break;
-      if ((delayDirty || stopPending || releasePending) && cfgChar) {   // settings use the same one-at-a-time queue
-        const d = typeDelay(), flags = (stopPending ? 1 : 0) | (paused ? 2 : 0) | (releasePending ? 4 : 0);
-        delayDirty = false; stopPending = false; releasePending = false;
+      if ((delayDirty || stopPending || releasePending || resumePending) && cfgChar) {   // settings use the same one-at-a-time queue
+        const d = typeDelay(), flags = (stopPending ? 1 : 0) | (paused ? 2 : 0) | (releasePending ? 4 : 0) | (resumePending ? 8 : 0);
+        delayDirty = false; stopPending = false; releasePending = false; resumePending = false;
         try {
           // [3] = PC layout, so the Flipper presses the right keys for y/z, umlauts, symbols
           // [4] bit 1 = typos, bits 2-3 = thinking pauses, [5] = WPM for humanized text
           await gatt(() => cfgChar.writeValueWithResponse(new Uint8Array([d & 0xFF, d >> 8, flags, GERMAN_PC ? 1 : 0,
                                                                           ($("typos").checked ? 2 : 0) | (thinkLevel() << 2), humanWpm()])));
         } catch (e) {
-          delayDirty = true; if (flags & 1) stopPending = true; if (flags & 4) releasePending = true;   // try again
+          delayDirty = true; if (flags & 1) stopPending = true; if (flags & 4) releasePending = true; if (flags & 8) resumePending = true;   // try again
           throw e;
         }
         if (flags & 1) textLog = [];   // Stop: the Flipper throws away what it had
@@ -693,7 +716,7 @@ async function pump() {
       if (!queue.length) {
         // A setting, Stop, Pause or release may have come in while the last write
         // was in flight: send it now instead of waiting for the next input
-        if (cfgChar && (delayDirty || stopPending || releasePending)) continue;
+        if (cfgChar && (delayDirty || stopPending || releasePending || resumePending)) continue;
         break;
       }
 
@@ -898,7 +921,7 @@ function stopTyping() { queue = []; backlogMs = 0; setPaused(false, false); stop
 // Sent text and macros wait as well, and new touchpad/keyboard input is ignored.
 function setPaused(on, tell = true) {
   paused = on;
-  document.querySelectorAll(".pausebtn").forEach((b) => { b.textContent = on ? "Resume" : "Pause"; b.classList.toggle("on", on); });
+  updatePauseButtons();
   if (on) setStatus("Paused", connected);
   else if (connected) setStatus("Connected: " + device.name, true);
   if (tell) { delayDirty = true; pump(); }
@@ -975,10 +998,16 @@ function checkHumanSupport() {
 let bulkCancel = false;
 let bulkRunning = false;
 $("sendBulk").onclick = () => {
-  // Typing it now uses it up: don't leave it stored for Caps Lock as well
-  if (storedReady || storing) { typedText = $("bulk").value; clearStored(); }
+  markBoxTyped();   // typing it now uses it up: don't (also) leave it stored for Caps Lock
   typeBulk($("bulk").value);
 };
+// The box text is being typed: it must not be stored (again) for Caps Lock afterwards
+function markBoxTyped() {
+  typedText = $("bulk").value;
+  clearTimeout(storeTimer); storeTimer = null;
+  if (storedReady || storing || storedText !== null) clearStored();
+  showStoreInfo();
+}
 
 // ---------------- stored text ----------------
 // The text in the box is sent to the Flipper in advance and saved there. Then a
@@ -1044,9 +1073,64 @@ $("clipBulk").onclick = async () => {
 async function typeBulk(raw, capsBefore = null) {
   if (bulkRunning) { showErr("Already typing: tap Stop first."); return; }
   if (!connected) { showErr("Connect to the Flipper first."); return; }
+  if (flipperRunning) { showErr("The Flipper is still typing a text: wait, or tap Stop first."); return; }
+  if (paused) setPaused(false);   // a new text means "go": nothing is sent while paused
+  // Macro recording: one text step (the packets below aren't recorded one by one)
+  if (recording && !playing) rec({ t: "text", s: toAscii(raw) });
   bulkRunning = true;
-  jobBegin(capsBefore);
-  try { await typeBulkNow(raw); } finally { jobEnd(); bulkRunning = false; }
+  try {
+    // Preferred: send the whole text first, the Flipper types it by itself
+    if (await typeOnFlipper(raw, capsBefore)) return;
+    // Fallback (older Flipper app, very long text, Flipper couldn't save it): the old way
+    jobBegin(capsBefore);
+    try { await typeBulkNow(raw); } finally { jobEnd(); }
+  } finally { bulkRunning = false; }
+}
+
+// Send the whole text to the Flipper, which saves it and types it by itself, so
+// locking the phone or losing the connection doesn't stop it any more.
+// Returns true if the Flipper took it (or it was cancelled), false = stream it instead.
+const RUN_MAX_CHARS = 20000;
+async function typeOnFlipper(raw, capsBefore) {
+  if (!connected || flipperVersion < 5 || !progressChar) return false;
+  if (mods) return false;   // Ctrl/Alt/... armed: send as shortcuts, the old way
+  const text = toAscii(raw);
+  if (!text) return true;
+  if (text.length > RUN_MAX_CHARS) return false;
+  const bytes = Array.from(new TextEncoder().encode(text));
+  const runsBefore = runsAccepted, doneBefore = flipperDone;
+  const total = 1 + 2 + bytes.length + 2 * Math.ceil(bytes.length / TEXT_CHUNK);
+  bulkCancel = false;
+  send(OP.RUN_BEGIN);
+  for (let i = 0; i < bytes.length; i += TEXT_CHUNK) {
+    const part = bytes.slice(i, i + TEXT_CHUNK);
+    send(OP.RUN_DATA, part.length, ...part);
+  }
+  send(OP.RUN_END, (humanOn() ? 1 : 0) | (capsBefore === null ? 0 : (2 | (capsBefore ? 4 : 0))));
+  await waitFlipperDone(() => {
+    if (!paused) setStatus(`Sending the text to the Flipper… ${Math.min(99, Math.round((flipperDone - doneBefore) / total * 100))}%`, connected);
+    return bulkCancel;
+  });
+  if (bulkCancel) return true;
+  if (!connected) {
+    showErr("The connection was lost while sending the text. If it had reached the Flipper completely, the Flipper types it anyway.");
+    return true;
+  }
+  if (runsAccepted === runsBefore) {   // the Flipper couldn't save it (e.g. SD card)
+    showErr("The Flipper couldn't save the text, so it's sent while typing instead (the phone has to stay on).");
+    return false;
+  }
+  // Taken: the Flipper types it alone. Wait until it's done (or Stop / connection lost).
+  let lastRead = performance.now();
+  while (connected && flipperRunning && !bulkCancel) {
+    if (!paused && !capsPaused) setStatus("Typing on the Flipper… (you can lock the phone now)", true);
+    await sleep(100);
+    if (!progressNotify && performance.now() - lastRead > 1000) { lastRead = performance.now(); await refreshProgress(); }
+  }
+  if (!connected && !bulkCancel)
+    showErr("The connection was lost, but the Flipper has the whole text and keeps typing it.");
+  else if (connected && !paused) setStatus("Connected: " + device.name, true);
+  return true;
 }
 
 // A "text job" (Send text, Clipboard, a macro's text): the Flipper switches Caps Lock
@@ -1085,7 +1169,7 @@ async function typeBulkNow(raw) {
   if (!bulkCancel && !connected) showErr("The connection dropped before the Flipper finished typing. Send the rest again once it's back.");
   if (connected && !paused) setStatus("Connected: " + device.name, true);
 }
-$("pauseBulk").onclick = () => { if (connected) setPaused(!paused); };
+$("pauseBulk").onclick = togglePause;
 $("stopBulk").onclick = () => { bulkCancel = true; stopTyping(); send(OP.RELEASE); };
 
 // ---------------- mouse buttons ----------------
@@ -1254,7 +1338,7 @@ function rec(step) {
   save(); showBar();
 }
 function recordBytes(b) {
-  if (!recording || playing) return;
+  if (!recording || playing || bulkRunning) return;   // Send text / Clipboard are recorded as one step in typeBulk
   switch (b[0]) {
     case OP.TAP: rec({ t: "key", k: keyToName(b[1], b[2]) }); break;
     case OP.DOWN: rec({ t: "press", b: b[1] }); break;
@@ -1446,7 +1530,7 @@ $("mdel").onclick = () => {
 $("mclear").onclick = () => { if (steps().length && confirm("Remove every step from this macro?")) { macros[curName] = []; save(); renderSteps(); } };
 $("addStep").onclick = () => { steps().push(NEW_STEP[$("addType").value]()); save(); renderSteps(); $("steps").lastChild.scrollIntoView?.({ block: "nearest" }); };
 $("recBtn").onclick = () => recording ? stopRec() : startRec();
-$("recPause").onclick = () => { if (connected) setPaused(!paused); };
+$("recPause").onclick = togglePause;
 $("recStop").onclick = () => { if (recording) stopRec(); else stopPlay(); };
 $("playBtn").onclick = play;
 

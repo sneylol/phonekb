@@ -25,9 +25,17 @@ The computer needs **no drivers, no software and no Bluetooth**. It just sees a 
 - **Macros:** record what you do, edit the steps (keys, text, clicks, mouse moves, waits), and replay them, as many times as you like
 - **Import / export:** save all your macros and groups, or just the ones you pick, to a file and load them on another phone
 - **Remote:** sort macros into groups (e.g. Work, Gaming) and get a page of big buttons, one tap per macro
-- **Send a block of text:** paste a paragraph on the phone and have it typed out on the PC
+- **Send a block of text:** paste a paragraph on the phone and have it typed out on the PC. **Clipboard** types what you last copied on the phone. With the mntm-012 build the whole text is sent to the Flipper first (up to 20,000 characters) and the Flipper types it by itself, so locking the phone or losing the connection doesn't stop it. Pause / Resume / Stop work from the phone, Back stops it on the Flipper.
+- **Humanize (mntm-012 build):** Send text, Clipboard and macro text are typed like a person: natural rhythm, keyboard geometry, pauses after punctuation, realistic key hold times. Choose the speed (15–150 WPM), optional **typos** (a neighbouring key, fixed with Backspace) and **thinking pauses** (Off / Light / Normal / Heavy: pauses every few sentences and before new paragraphs). Live typing on the phone keyboard is never delayed.
+- **Letter delay:** a pause after each typed letter (0 ms – 5 s), for apps or PCs that drop fast input.
 - **Works offline:** install it from Chrome and it runs with no internet
-- **Caps Lock pauses typing (Momentum mntm-012 build):** while the Flipper is typing, press Caps Lock on the PC to pause, press it again to continue. Works on Windows and Linux. On a Mac, a press on the Mac's own keyboard isn't passed on to other keyboards, so use the Pause button on the phone there. (The app brings its own USB keyboard for this: Momentum's can't receive the Caps Lock state.)
+- **Caps Lock on the PC (mntm-012 build, Windows and Linux):**
+  - **While the Flipper types:** Caps Lock pauses, Caps Lock again resumes (or tap Resume on the phone).
+  - **While it's idle ("Caps Lock types clipboard", on by default):** text pasted into the Send text box is stored on the Flipper ("✓ Stored on the Flipper"); a Caps Lock press then makes the Flipper type it by itself, even with the phone locked. It's used once; edit or paste new text to store it again. With an empty box, the phone's clipboard is typed instead (Bluefy open and the screen on), falling back to the box. Turn the switch off if you use Caps Lock normally and don't want this.
+  - Text is always typed with Caps Lock off (with it on, some PCs shift every key: `,` → `;`, `?` → `ß`); Caps Lock is put back the way it was afterwards.
+  - Plugging the Flipper into a PC that has Caps Lock on doesn't start anything: that first state is ignored.
+  - **On a Mac** this doesn't work: macOS doesn't pass a Caps Lock press on the Mac's own keyboard on to other keyboards, so the Flipper never sees it. Use Pause on the phone. Also keep Caps Lock off on a Mac while the Flipper types, otherwise letters come out with the wrong case.
+  - (The app brings its own USB keyboard for this: Momentum's can't receive the Caps Lock state. To the PC it's the same device.)
 - **No pairing codes (Momentum mntm-012 build):** the page keeps a random secret key and the Flipper only accepts the first phone that connects, so other nearby devices can't type on your PC. The link isn't Bluetooth-encrypted, so someone sniffing Bluetooth nearby could read what you type. The other `.fap` builds still use a 6-digit PIN.
 
 ## Requirements
@@ -81,6 +89,8 @@ On the Flipper: **Back** exits, **hold Left** forgets the linked phone (the next
 |---|---|
 | "Web Bluetooth isn't available" | Use Chrome on Android, and open the https:// link (not a downloaded file). |
 | PhoneKB doesn't appear in the list | Make sure the app is open on the Flipper, phone Location is on, and the Flipper phone app is closed. |
+| Typing stops when the phone locks | Use Send text / Clipboard / the stored text (mntm-012 build): the text is on the Flipper and keeps going. Only very long texts (over 20,000 characters) and macros still need the phone awake. |
+| Letters come out in the wrong case on a Mac | Caps Lock is on: macOS doesn't tell the Flipper. Switch it off. |
 | "Wrong key" | The Flipper is linked to another phone or browser (or this browser's data was cleared). Hold Left on the Flipper, then tap Connect. |
 | Pairing fails (PIN builds) | Hold Left on the Flipper to forget old pairings, remove "PhoneKB" from Android's Bluetooth settings, and try again. |
 | Flipper crashes with "HardFault" | Wrong `.fap` for your firmware version; see the table above. |
@@ -88,7 +98,7 @@ On the Flipper: **Back** exits, **hold Left** forgets the linked phone (the next
 
 ## Limitations
 
-- Android + Chrome only.
+- Android + Chrome, or iPhone with a Web Bluetooth browser such as Bluefy. (Bluefy can't reconnect by itself after a page reload: tap Connect and pick the Flipper.)
 - US or German PC keyboard layout (German needs the mntm-012 build).
 - While the app is running, qFlipper and the Flipper phone app can't connect to the Flipper.
 

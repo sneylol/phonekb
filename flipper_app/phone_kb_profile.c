@@ -96,7 +96,7 @@ static const BleGattCharacteristicParams phone_kb_chars[PhoneKbCharCount] = {
     [PhoneKbCharProgress] =
         {.name = "Progress",
          .data_prop_type = FlipperGattCharacteristicDataFixed,
-         .data.fixed.length = 5,
+         .data.fixed.length = 6,
          .uuid.Char_UUID_128 = PHONE_KB_CHAR_UUID(0x68),
          .uuid_type = UUID_TYPE_128,
          .char_properties = CHAR_PROP_READ | CHAR_PROP_NOTIFY,
@@ -129,6 +129,7 @@ typedef struct {
     volatile uint16_t letter_delay_ms;
     volatile uint32_t stop_count;
     volatile uint32_t release_count;
+    volatile uint32_t resume_count;
     volatile bool paused;
     volatile uint8_t layout;
     volatile uint8_t wpm;
@@ -206,6 +207,7 @@ static BleEventAckStatus phone_kb_event_handler(void* event, void* context) {
             if(mod->Attr_Data_Length >= 3) {
                 if(mod->Attr_Data[2] & 1) p->stop_count++;
                 if(mod->Attr_Data[2] & 4) p->release_count++;
+                if(mod->Attr_Data[2] & 8) p->resume_count++;
                 p->paused = (mod->Attr_Data[2] & 2) != 0;
             }
             if(mod->Attr_Data_Length >= 4) p->layout = mod->Attr_Data[3];
@@ -237,7 +239,7 @@ static FuriHalBleProfileBase* ble_profile_phone_kb_start(FuriHalBleProfileParams
     p->auth = PhoneKbAuthWaiting;
     p->letter_delay_ms = PHONE_KB_DEFAULT_LETTER_DELAY_MS;
     phone_kb_publish_auth(p, PhoneKbAuthWaiting);
-    uint8_t zero[5] = {0};
+    uint8_t zero[6] = {0};
     ble_gatt_characteristic_update(p->svc_handle, &p->chars[PhoneKbCharProgress], zero);
     uint8_t version = PHONE_KB_PROTOCOL_VERSION;
     ble_gatt_characteristic_update(p->svc_handle, &p->chars[PhoneKbCharInfo], &version);
@@ -377,15 +379,17 @@ uint32_t ble_profile_phone_kb_get_release_count(FuriHalBleProfileBase* profile) 
 void ble_profile_phone_kb_publish_progress(
     FuriHalBleProfileBase* profile,
     uint32_t bytes_done,
-    uint8_t state) {
+    uint8_t state,
+    uint8_t runs_accepted) {
     furi_check(profile && (profile->config == ble_profile_phone_kb));
     BleProfilePhoneKb* p = (BleProfilePhoneKb*)profile;
-    uint8_t le[5] = {
+    uint8_t le[6] = {
         bytes_done & 0xFF,
         (bytes_done >> 8) & 0xFF,
         (bytes_done >> 16) & 0xFF,
         bytes_done >> 24,
-        state};
+        state,
+        runs_accepted};
     ble_gatt_characteristic_update(p->svc_handle, &p->chars[PhoneKbCharProgress], le);
 }
 
@@ -402,4 +406,9 @@ bool ble_profile_phone_kb_get_typos(FuriHalBleProfileBase* profile) {
 uint8_t ble_profile_phone_kb_get_think(FuriHalBleProfileBase* profile) {
     furi_check(profile && (profile->config == ble_profile_phone_kb));
     return ((BleProfilePhoneKb*)profile)->think;
+}
+
+uint32_t ble_profile_phone_kb_get_resume_count(FuriHalBleProfileBase* profile) {
+    furi_check(profile && (profile->config == ble_profile_phone_kb));
+    return ((BleProfilePhoneKb*)profile)->resume_count;
 }

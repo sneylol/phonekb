@@ -30,6 +30,12 @@
  *                        is switched off for typing and restored at the end. flags bit 0:
  *                        "state before" given in bit 1 (Caps Lock start), else read now
  *   0x10                 text job ends: Caps Lock back to how it was
+ *   0x11                 "type now" text: start a new one
+ *   0x12 len bytes...    "type now" text: more UTF-8 text (saved to the SD card)
+ *   0x13 flags           "type now" text: done, type it now (Send text / Clipboard).
+ *                        flags bit 0 humanized, bit 1 "Caps Lock before" given in bit 2.
+ *                        Once saved, it's typed by the Flipper alone: a lost
+ *                        connection doesn't stop it.
  *   0x0E flags           stored text: done (flags bit 0: humanized). From now on a
  *                        Caps Lock press on the PC while idle makes the Flipper type
  *                        it by itself, even with the phone locked or disconnected.
@@ -58,6 +64,7 @@
 #define TOKEN_PATH       APP_DATA_PATH(".phone_kb.token")
 #define EVENT_LOG_PATH   APP_DATA_PATH("events.log")
 #define STORED_PATH      APP_DATA_PATH("stored_text.txt")
+#define RUN_PATH         APP_DATA_PATH("run_text.txt")
 #define STORED_MAX       (64 * 1024)
 #define EVENT_LOG_MAX    (16 * 1024)
 #define RX_BUF_SIZE      2048
@@ -84,6 +91,9 @@ typedef enum {
     OpStoreEnd = 0x0E,
     OpJobBegin = 0x0F,
     OpJobEnd = 0x10,
+    OpRunBegin = 0x11,
+    OpRunData = 0x12,
+    OpRunEnd = 0x13,
 } Op;
 
 typedef struct {
@@ -142,8 +152,29 @@ typedef struct {
     bool stored_human;
     bool stored_start; // Caps Lock pressed: type the stored text (main loop)
     bool stored_caps_before; // Caps Lock state before that press
-    bool stored_typing; // typing the stored text (doesn't need the phone)
+    bool stored_typing; // typing a saved text (stored or "type now"): doesn't need the phone
+
+    // "Type now" text (Send text / Clipboard): saved first, then typed by the Flipper alone
+    File* run_file;
+    uint32_t run_len;
+    bool run_ok; // everything received was written
+    bool run_start; // received completely: type it (main loop)
+    bool run_typing;
+    bool run_human;
+    bool run_caps_before;
+    uint8_t runs_accepted; // counts "type now" texts accepted (the phone compares it)
     uint32_t own_caps_until; // tick until which a Caps Lock change is our own key press
+    bool usb_up; // USB keyboard connected to a PC (last seen)
+    uint32_t usb_up_at; // when it (re)connected: its first Caps Lock report is the PC's state, not a press
+    bool phone_held; // the phone's Pause was on while typing (kept if the link drops)
+    uint32_t resume_seen; // last "resume" request from the phone handled
+    bool store_ok; // every part of the stored text was written
+
+    // what was last reported to the phone (PROGRESS) and when
+    uint32_t published_progress;
+    uint8_t published_state;
+    uint8_t published_runs;
+    uint32_t published_at;
 } PhoneKb;
 
 // ---------------------------------------------------------------- BLE side
@@ -278,9 +309,20 @@ static bool caps_lock_on(void) {
 }
 
 static void caps_check(PhoneKb* app) {
+    // A PC that connects (plug-in, wake from sleep, KVM switch) sends its current
+    // Caps Lock state: that's not a key press, just take it as the starting point
+    bool usb = pkb_hid_is_connected();
+    if(usb != app->usb_up) {
+        app->usb_up = usb;
+        if(usb) app->usb_up_at = furi_get_tick() | 1;
+    }
     bool on = caps_lock_on();
     if(on == app->caps_led) return;
     app->caps_led = on;
+    if(!usb || (app->usb_up_at && furi_get_tick() - app->usb_up_at < 1500)) {
+        event_log("Caps Lock %s (PC connected: its current state)", on ? "on" : "off");
+        return;
+    }
     // Our own Caps Lock press (phone's Caps button, or restoring Caps Lock after a text)
     if((int32_t)(app->own_caps_until - furi_get_tick()) > 0) {
         event_log("Caps Lock %s (own key press)", on ? "on" : "off");
@@ -290,8 +332,10 @@ static void caps_check(PhoneKb* app) {
         event_log("Caps Lock %s (phone paused: ignored)", on ? "on" : "off");
         return;
     }
-    bool busy = app->typing_active || app->caps_paused ||
-                furi_stream_buffer_bytes_available(app->rx) > 0;
+    // Busy = a text is being typed (or a text job / saved text is under way). Not
+    // "bytes waiting from the phone": those can be mouse moves or a background upload.
+    bool busy = app->typing_active || app->caps_paused || app->job_active || app->run_start ||
+                app->run_typing || app->stored_typing;
     if(!busy) {
         if(app->stored_ready) {
             // A stored text is waiting: the Flipper types it by itself (main loop)
@@ -315,12 +359,18 @@ static bool is_paused(PhoneKb* app) {
     return app->caps_paused || ble_profile_phone_kb_is_paused(app->profile);
 }
 
-// Press Caps Lock ourselves (caps_check knows it's ours) and let the PC update the light
-static void press_own_caps(PhoneKb* app) {
-    app->own_caps_until = furi_get_tick() + 400;
+// Press Caps Lock ourselves (caps_check knows it's ours) and wait up to 500 ms for
+// the PC to report the new state. The "own press" window is extended past that
+// report, so even a slow PC's answer is never mistaken for a user's press.
+// Returns true if Caps Lock now matches want_on.
+static bool press_own_caps(PhoneKb* app, bool want_on) {
+    app->own_caps_until = furi_get_tick() + 600;
     pkb_hid_kb_press(HID_KEYBOARD_CAPS_LOCK);
     furi_delay_ms(30);
     pkb_hid_kb_release(HID_KEYBOARD_CAPS_LOCK);
+    for(int w = 0; w < 50 && caps_lock_on() != want_on; w++) furi_delay_ms(10);
+    app->own_caps_until = furi_get_tick() + 200;
+    return caps_lock_on() == want_on;
 }
 
 // Typing always happens with Caps Lock OFF: with it on, some PCs shift every key
@@ -331,16 +381,54 @@ static void ensure_caps_off(PhoneKb* app, uint32_t first_wait_ms) {
     for(int attempt = 0; attempt < 3 && caps_lock_on(); attempt++) {
         furi_delay_ms(attempt == 0 ? first_wait_ms : 250);
         if(!caps_lock_on()) break;
-        press_own_caps(app);
-        for(int w = 0; w < 50 && caps_lock_on(); w++) furi_delay_ms(10); // the PC's answer
+        press_own_caps(app, false);
     }
     if(caps_lock_on()) event_log("Caps Lock: couldn't switch it off before typing");
+}
+
+// Tell the phone how far we are (flow control) and the state (Caps Lock pause,
+// stored text, saved text being typed). Called by the main loop and, while a long
+// text is typed, every 250 ms from the typing loop.
+static void publish_state(PhoneKb* app) {
+    uint32_t progress = app->bytes_done + app->rx_dropped;
+    uint8_t state = (app->caps_paused ? PHONE_KB_STATE_CAPS_PAUSED : 0) |
+                    (app->caps_led ? PHONE_KB_STATE_CAPS_ON : 0) |
+                    (app->stored_ready ? PHONE_KB_STATE_STORED : 0) |
+                    ((app->run_start || app->run_typing) ? PHONE_KB_STATE_RUNNING : 0) |
+                    (uint8_t)((app->start_requests & 0x0F) << PHONE_KB_STATE_START_SHIFT);
+    app->published_at = furi_get_tick();
+    if(progress != app->published_progress || state != app->published_state ||
+       app->runs_accepted != app->published_runs) {
+        app->published_progress = progress;
+        app->published_state = state;
+        app->published_runs = app->runs_accepted;
+        ble_profile_phone_kb_publish_progress(app->profile, progress, state, app->published_runs);
+    }
+}
+
+// The phone tapped Resume: end a pause the Flipper holds (Caps Lock pause, or one
+// kept after the phone's link dropped)
+static void check_resume_request(PhoneKb* app) {
+    uint32_t resumes = ble_profile_phone_kb_get_resume_count(app->profile);
+    if(resumes != app->resume_seen) {
+        app->resume_seen = resumes;
+        if(app->caps_paused) {
+            app->caps_paused = false;
+            event_log("resumed from the phone");
+            view_port_update(app->view_port);
+        }
+    }
 }
 
 // Checked between letters (and every 10 ms of a letter pause): stop typing when
 // the phone taps Stop, the phone disconnects, or Back is pressed on the Flipper.
 static bool typing_should_stop(PhoneKb* app) {
     caps_check(app);
+    check_resume_request(app);
+    if(furi_get_tick() - app->published_at >= 250) {
+        publish_state(app);
+        ble_profile_phone_kb_sync_status(app->profile); // key check result after a reconnect
+    }
     uint32_t stops = ble_profile_phone_kb_get_stop_count(app->profile);
     if(stops != app->stop_seen) {
         app->stop_seen = stops;
@@ -397,7 +485,21 @@ static void check_release_request(PhoneKb* app) {
 // Hold here while the phone has paused typing. Returns false if typing should stop.
 static bool wait_while_paused(PhoneKb* app) {
     bool waited = false;
-    while(is_paused(app)) {
+    for(;;) {
+        bool phone_paused = ble_profile_phone_kb_is_paused(app->profile);
+        if(phone_paused) {
+            app->phone_held = true;
+        } else if(app->phone_held) {
+            app->phone_held = false;
+            // The link dropped while the phone had paused a saved text (which keeps
+            // going without the phone): stay paused. Caps Lock or Resume continues.
+            if(app->stored_typing && !ble_profile_phone_kb_is_connected(app->profile)) {
+                app->caps_paused = true;
+                event_log("phone gone while paused: staying paused (Caps Lock or Resume continues)");
+                view_port_update(app->view_port);
+            }
+        }
+        if(!is_paused(app)) break;
         waited = true;
         furi_delay_ms(10);
         check_release_request(app);
@@ -627,12 +729,15 @@ static uint16_t packet_length(const uint8_t* p, uint16_t have) {
     case OpText:
     case OpTextHuman:
     case OpStoreData:
+    case OpRunData:
         return (have < 2) ? 0xFFFF : (uint16_t)(2 + p[1]);
     case OpStoreBegin:
     case OpJobEnd:
+    case OpRunBegin:
         return 1;
     case OpStoreEnd:
     case OpJobBegin:
+    case OpRunEnd:
         return 2;
     default:
         return 1; // unknown byte: skip it to resync
@@ -652,13 +757,13 @@ static void stored_clear(PhoneKb* app) {
     storage_simply_remove(app->storage, STORED_PATH);
 }
 
-// Type the stored text: Caps Lock was pressed while idle. Works without the phone.
-static void stored_type(PhoneKb* app) {
-    app->stored_ready = false; // used once
+// Type a saved text file by the Flipper alone (the phone may be locked or gone):
+// Caps Lock off while typing, back to caps_before at the end. True if typed to the end.
+static bool type_file(PhoneKb* app, const char* path, bool human, bool caps_before) {
     File* f = storage_file_alloc(app->storage);
-    if(!storage_file_open(f, STORED_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+    if(!storage_file_open(f, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
         storage_file_free(f);
-        return;
+        return false;
     }
     app->stored_typing = true;
     app->typing_active = true;
@@ -674,7 +779,7 @@ static void stored_type(PhoneKb* app) {
     uint8_t buf[64];
     size_t n;
     while(ok && (n = storage_file_read(f, buf, sizeof(buf))) > 0) {
-        if(app->stored_human) {
+        if(human) {
             ok = hum_text(app, buf, (uint8_t)n);
         } else {
             for(size_t i = 0; i < n && ok; i++) {
@@ -685,29 +790,47 @@ static void stored_type(PhoneKb* app) {
     }
     storage_file_close(f);
     storage_file_free(f);
-    storage_simply_remove(app->storage, STORED_PATH);
+    storage_simply_remove(app->storage, path);
 
     app->typing_active = false;
     app->stored_typing = false;
     app->caps_paused = false;
     release_everything(app);
-    // Caps Lock back to how it was before the press that started this
-    if(caps_lock_on() != app->stored_caps_before) {
-        press_own_caps(app);
-        furi_delay_ms(80);
-    }
-    event_log(ok ? "stored text typed" : "stored text stopped");
+    // Caps Lock back to how it was
+    if(caps_lock_on() != caps_before) press_own_caps(app, caps_before);
     view_port_update(app->view_port);
+    return ok;
+}
+
+// Type the stored text: Caps Lock was pressed while idle. Works without the phone.
+static void stored_type(PhoneKb* app) {
+    app->stored_ready = false; // used once
+    bool ok = type_file(app, STORED_PATH, app->stored_human, app->stored_caps_before);
+    event_log(ok ? "stored text typed" : "stored text stopped");
+}
+
+// "Type now" text (Send text / Clipboard), received completely. Works without the phone.
+static void run_type(PhoneKb* app) {
+    event_log("typing text from the phone (%lu bytes, saved first)", (unsigned long)app->run_len);
+    app->run_typing = true;
+    bool ok = type_file(app, RUN_PATH, app->run_human, app->run_caps_before);
+    app->run_typing = false;
+    event_log(ok ? "text typed" : "text stopped");
+}
+
+static void run_close(PhoneKb* app) {
+    if(app->run_file) {
+        storage_file_close(app->run_file);
+        storage_file_free(app->run_file);
+        app->run_file = NULL;
+    }
 }
 
 // End of a text job (or Stop / disconnect during one): Caps Lock back to how it was
 static void job_restore(PhoneKb* app) {
     if(!app->job_active) return;
     app->job_active = false;
-    if(caps_lock_on() != app->job_caps_before) {
-        press_own_caps(app);
-        for(int w = 0; w < 30 && caps_lock_on() != app->job_caps_before; w++) furi_delay_ms(10);
-    }
+    if(caps_lock_on() != app->job_caps_before) press_own_caps(app, app->job_caps_before);
 }
 
 // First text after a Caps Lock start request (the phone types its clipboard or box):
@@ -779,6 +902,41 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
         app->typing_active = false;
         view_port_update(app->view_port);
         break;
+    case OpRunBegin:
+        app->start_request_tick = 0; // handled: don't touch Caps Lock for later typing
+        run_close(app);
+        app->run_start = false;
+        app->run_len = 0;
+        app->run_file = storage_file_alloc(app->storage);
+        app->run_ok = storage_file_open(app->run_file, RUN_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS);
+        if(!app->run_ok) {
+            storage_file_free(app->run_file);
+            app->run_file = NULL;
+        }
+        break;
+    case OpRunData:
+        if(app->run_file && app->run_ok) {
+            if(app->run_len + p[1] > STORED_MAX ||
+               storage_file_write(app->run_file, &p[2], p[1]) != p[1])
+                app->run_ok = false;
+            else
+                app->run_len += p[1];
+        }
+        break;
+    case OpRunEnd:
+        run_close(app);
+        if(app->run_ok && app->run_len > 0) {
+            app->run_human = (p[1] & 1) != 0;
+            app->run_caps_before = (p[1] & 2) ? ((p[1] & 4) != 0) : caps_lock_on();
+            app->run_start = true; // typed by the main loop, after it told the phone
+            app->runs_accepted++;
+        } else {
+            // The phone sees "not running" and sends the text the old way instead
+            event_log("couldn't save the text from the phone: it will stream it instead");
+            storage_simply_remove(app->storage, RUN_PATH);
+        }
+        app->run_ok = false;
+        break;
     case OpJobBegin:
         // Remember Caps Lock (or take the state the phone says it had before the
         // user's start press), then type with it off
@@ -793,6 +951,7 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
     case OpStoreBegin:
         stored_clear(app);
         app->store_file = storage_file_alloc(app->storage);
+        app->store_ok = true;
         if(!storage_file_open(app->store_file, STORED_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
             storage_file_free(app->store_file);
             app->store_file = NULL;
@@ -801,8 +960,12 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
         view_port_update(app->view_port);
         break;
     case OpStoreData:
-        if(app->store_file && app->store_len + p[1] <= STORED_MAX) {
-            if(storage_file_write(app->store_file, &p[2], p[1]) == p[1]) app->store_len += p[1];
+        if(app->store_file && app->store_ok) {
+            if(app->store_len + p[1] <= STORED_MAX &&
+               storage_file_write(app->store_file, &p[2], p[1]) == p[1])
+                app->store_len += p[1];
+            else
+                app->store_ok = false; // never type a text with pieces missing
         }
         break;
     case OpStoreEnd:
@@ -810,7 +973,11 @@ static void execute_packet(PhoneKb* app, const uint8_t* p) {
             storage_file_close(app->store_file);
             storage_file_free(app->store_file);
             app->store_file = NULL;
-            app->stored_ready = app->store_len > 0;
+            app->stored_ready = app->store_ok && app->store_len > 0;
+            if(!app->store_ok) {
+                event_log("stored text: couldn't save it completely (SD card?)");
+                storage_simply_remove(app->storage, STORED_PATH);
+            }
             app->stored_human = (p[1] & 1) != 0;
             if(app->stored_ready)
                 event_log(
@@ -841,6 +1008,13 @@ static void clear_queue(PhoneKb* app, bool was_typing) {
     app->bytes_done += dropped;
     release_everything(app);
     job_restore(app); // a text job that was cut off: Caps Lock back to how it was
+    // Stop also cancels a "type now" text that is being received or about to start
+    // (not one already being typed: that one stops by itself)
+    if(!app->run_typing) {
+        app->run_start = false;
+        run_close(app);
+        app->run_ok = false;
+    }
     if(was_typing || dropped) {
         event_log("typing stopped, %lu queued bytes dropped", (unsigned long)dropped);
     }
@@ -874,10 +1048,12 @@ static void draw_cb(Canvas* canvas, void* context) {
     const char* phone = "Phone: waiting...";
     if(app->rejected) {
         phone = "Phone: wrong key!";
+    } else if(app->caps_paused && !app->ble_connected) {
+        phone = "PAUSED (Caps Lock)";
     } else if(app->stored_typing) { // doesn't need the phone
         phone = app->caps_paused ? "PAUSED (Caps Lock)" :
-                app->thinking    ? "Stored text: thinking..." :
-                                   "Typing stored text";
+                app->thinking    ? "Typing: thinking..." :
+                                   "Typing (phone not needed)";
     } else if(app->ble_connected) {
         if(ble_profile_phone_kb_get_auth(app->profile) != PhoneKbAuthOk) {
             phone = "Phone: checking key...";
@@ -958,9 +1134,7 @@ int32_t phone_kb_app(void* p) {
     bool shown_connected = false;
     bool shown_paused = false;
     uint32_t link_up_at = 0;
-    uint32_t published_progress = 0;
     uint8_t logged_leds = 0xFF;
-    uint8_t published_state = 0;
     uint32_t logged_dropped = 0;
     while(running) {
         // While paused, leave everything queued where it is
@@ -996,16 +1170,15 @@ int32_t phone_kb_app(void* p) {
         }
         check_release_request(app);
 
+        check_resume_request(app);
         // Tell the phone how far we are, so it sends more exactly when there's room
-        uint32_t progress = app->bytes_done + app->rx_dropped;
-        uint8_t state = (app->caps_paused ? PHONE_KB_STATE_CAPS_PAUSED : 0) |
-                        (app->caps_led ? PHONE_KB_STATE_CAPS_ON : 0) |
-                        (app->stored_ready ? PHONE_KB_STATE_STORED : 0) |
-                        (uint8_t)((app->start_requests & 0x0F) << PHONE_KB_STATE_START_SHIFT);
-        if(progress != published_progress || state != published_state) {
-            published_progress = progress;
-            published_state = state;
-            ble_profile_phone_kb_publish_progress(app->profile, progress, state);
+        publish_state(app);
+
+        // A "type now" text arrived completely: the phone now knows (state above), so type it
+        if(app->run_start) {
+            app->run_start = false;
+            run_type(app);
+            continue; // publish "done" right away
         }
 
         if(app->token_save_pending) {
@@ -1095,7 +1268,10 @@ int32_t phone_kb_app(void* p) {
         }
     }
 
+    job_restore(app); // Back during a text job: Caps Lock back to how it was
     stored_clear(app);
+    run_close(app);
+    storage_simply_remove(app->storage, RUN_PATH);
     furi_record_close(RECORD_STORAGE);
     event_log("exit");
 
