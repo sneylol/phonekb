@@ -1,5 +1,5 @@
 // Offline cache for Phone Keyboard. Bump VERSION when you change any file.
-const VERSION = "phonekb-v38-claude1";
+const VERSION = "phonekb-v39-claude2";
 const FILES = ["./", "./index.html", "./manifest.json", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {

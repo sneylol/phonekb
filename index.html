@@ -1914,6 +1914,33 @@ window.addEventListener("pagehide", () => { if (connected) device.gatt.disconnec
 const CLAUDE_MODEL = "claude-opus-5-5";
 const SDK_URL = "https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@1.7.0/+esm";
 const DEFAULT_INSTR = "okay dieser chat wird dafür da sein um english texte generieren zu lassen. ich habe dir alle references für context hochgeladen damit du weißt. der ablauf wird so sein, ich werde dir ein bild von einer aufgabe schicken oder direkt auch 2 oder 3 bilder wo man 2 oder einen text schreiben muss und du wirst mir als antwort einfach nur den text oder die texte nacheinander geben ohne irgendwas anderes also wirklich nur die texte";
+// Added to every request: the answer is typed as is, so no Markdown and no blanks to fill in
+const FORMAT_RULE = "Output format: plain text only, exactly as it will be typed into a normal text field. " +
+  "No Markdown or other formatting: no ** or * for bold or italics, no # headings, no --- lines, no > quotes, " +
+  "no [text](url) links (write a web address as plain text, e.g. www.example.com). " +
+  "Put each heading or subheading on its own line as plain words. Simple '- ' list items are fine where the text type needs a list. " +
+  "If you write more than one text, separate them with two empty lines. " +
+  "Never leave placeholders such as 20__, __, [Name] or XX: fill in suitable details yourself. " +
+  "If a date is needed and the task doesn't give one, use today's date, which is given in the message.";
+// Remove Markdown that still comes back (Claude's answer is typed character by character)
+function plainText(s) {
+  const year = String(new Date().getFullYear());
+  return s.replace(/\r\n?/g, "\n")
+    .replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, t, u) => (/^\S+\.\S+$/.test(t) || t === u ? t : `${t} (${u.replace(/^https?:\/\//, "")})`))
+    .replace(/^[ \t]{0,3}#{1,6}[ \t]+/gm, "")                     // # headings
+    .replace(/^[ \t]{0,3}>[ \t]?/gm, "")                          // > quotes
+    .replace(/^[ \t]*([-*_])([ \t]*\1){2,}[ \t]*$/gm, "")            // --- / *** lines
+    .replace(/^([ \t]*)[*+][ \t]+/gm, "$1- ")                     // * list items -> - list items
+    .replace(/\*\*(\S(?:[^*\n]*?\S)?)\*\*/g, "$1")          // **bold**
+    .replace(/(^|[^\w*])\*(\S(?:[^*\n]*?\S)?)\*(?![\w*])/gm, "$1$2")   // *italics*
+    .replace(/`([^`\n]+)`/g, "$1")                          // `code`
+    .replace(/\*\*/g, "")                                   // stray **
+    .replace(/\b20__\b/g, year)                             // a year left blank
+    .replace(/[ \t]+$/gm, "")
+    .replace(/\n{4,}/g, "\n\n\n")
+    .trim();
+}
+function todayText() { return new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" }); }
 const TASK_EDGE = 2576, REF_EDGE = 1568;   // long edge in px: tasks full detail, references cheaper
 // Claude Opus 5.5, $ per million tokens: input, cache write (5 min), cache read, output
 const PRICE = { in: 4, write: 5, read: 0.2, out: 20 };
@@ -2048,7 +2075,7 @@ async function writeWithClaude() {
       claudeRefs.forEach((r) => content.push(img(r.b64)));
       content[content.length - 1].cache_control = { type: "ephemeral" };   // same every time: cached, ~1/20 of the price
     }
-    content.push({ type: "text", text: claudeTasks.length === 1 ? "Aufgabe:" : `Aufgabe (${claudeTasks.length} Bilder):` });
+    content.push({ type: "text", text: `Today's date: ${todayText()}.\n` + (claudeTasks.length === 1 ? "Aufgabe:" : `Aufgabe (${claudeTasks.length} Bilder):`) });
     claudeTasks.forEach((t) => content.push(img(t.b64)));
     const stream = client.beta.messages.stream({
       model: CLAUDE_MODEL,
@@ -2056,7 +2083,7 @@ async function writeWithClaude() {
       betas: ["server-side-fallback-2026-07-01"],
       fallbacks: "default",   // if Opus declines, the API retries on a fallback model
       output_config: { effort: $("cEffort").value || "high" },
-      system: $("cInstr").value.trim() || DEFAULT_INSTR,
+      system: ($("cInstr").value.trim() || DEFAULT_INSTR) + "\n\n" + FORMAT_RULE,
       messages: [{ role: "user", content }],
     });
     ctl.abort = () => stream.abort();
@@ -2069,7 +2096,7 @@ async function writeWithClaude() {
     });
     const msg = await stream.finalMessage();
     if (msg.stop_reason === "refusal") throw new Error("Claude declined this task" + (msg.stop_details && msg.stop_details.explanation ? ": " + msg.stop_details.explanation : "."));
-    const text = msg.content.filter((b) => b.type === "text").map((b) => b.text).join("").trim();
+    const text = plainText(msg.content.filter((b) => b.type === "text").map((b) => b.text).join(""));
     if (!text) throw new Error("Claude sent no text back. Try again.");
     setBoxText(text);
     const u = msg.usage || {}, cost = ((u.input_tokens || 0) * PRICE.in + (u.cache_creation_input_tokens || 0) * PRICE.write +
