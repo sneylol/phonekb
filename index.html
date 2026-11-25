@@ -119,12 +119,39 @@
   .gitem button { padding: 6px 10px; }
   #rEditBtn.on { background: var(--key-active); color: #111; font-weight: 600; }
   #playBtn.on { background: #2f6fb0; }
+  /* ---- write with Claude ---- */
+  #claudeBtn, #remoteBtn, #macroBtn { padding: 8px 10px; }
+  #cpanel { display: none; position: fixed; inset: 0; z-index: 12; background: var(--bg); overflow-y: auto; padding-bottom: 40px; }
+  #cpanel.open { display: block; }
+  #cpanel header { position: sticky; top: 0; z-index: 1; }
+  .csec { padding: 10px 8px 0; }
+  .csec h4 { margin: 4px 4px 6px; color: var(--muted); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
+  .csec .row { padding: 6px 0 0; }
+  .thumbs { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 6px; }
+  .thumbs div { position: relative; width: 72px; height: 72px; border-radius: 8px; overflow: hidden; background: var(--panel); }
+  .thumbs.small div { width: 48px; height: 48px; }
+  .thumbs img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .thumbs button { position: absolute; top: 2px; right: 2px; padding: 0; width: 22px; height: 22px; border-radius: 11px;
+    background: rgba(0,0,0,.7); font-size: 13px; line-height: 22px; }
+  #cGo { background: var(--key-active); color: #111; font-weight: 600; }
+  #cGo:disabled { opacity: .45; }
+  .cmsg { font-size: 13px; color: var(--muted); padding: 6px 4px 0; min-height: 18px; }
+  .cmsg.bad { color: var(--bad); }
+  .cmsg.good { color: var(--ok); }
+  #cOut { height: 220px; margin-top: 6px; }
+  #cSet { margin: 14px 8px 0; border-top: 1px solid #23262d; padding-top: 8px; }
+  #cSet summary { color: var(--muted); font-size: 14px; padding: 6px 4px; }
+  #cSet label { display: block; color: var(--muted); font-size: 13px; padding: 8px 4px 0; }
+  #cSet input, #cSet select { font: inherit; font-size: 16px; width: 100%; margin-top: 4px; padding: 9px; border-radius: 8px;
+    border: 1px solid #333843; background: var(--panel); color: var(--text); }
+  #cInstr { height: 120px; margin-top: 4px; font-size: 14px; }
 </style>
 </head>
 <body>
 <header>
   <div id="dot"></div>
   <div id="status">Not connected</div>
+  <button id="claudeBtn">Write</button>
   <button id="remoteBtn">Remote</button>
   <button id="macroBtn">Macros</button>
   <button id="connect">Connect</button>
@@ -238,6 +265,35 @@
   <button data-key="79">→</button>
   <button data-key="76">Del</button>
   <button id="moreBtn">⋯</button>
+</div>
+
+<div id="cpanel">
+  <header><div class="rdot" id="cdot"></div><b style="flex:1">Write with Claude</b><button id="cclose" style="padding:8px 16px">Done</button></header>
+  <div class="csec">
+    <h4>Task (photos)</h4>
+    <div class="row r2"><button id="cCam">📷 Camera</button><button id="cLib">🖼 Photos</button></div>
+    <input id="cCamIn" type="file" accept="image/*" capture="environment" hidden>
+    <input id="cLibIn" type="file" accept="image/*" multiple hidden>
+    <div id="cTasks" class="thumbs"></div>
+    <div class="row r2"><button id="cGo">Write text</button><button id="cClear">Clear photos</button></div>
+    <div id="cMsg" class="cmsg"></div>
+  </div>
+  <div class="csec">
+    <h4>Text to type</h4>
+    <textarea id="cOut" placeholder="Claude's text appears here (you can edit it). It's stored on the Flipper: press Caps Lock on the PC to type it."></textarea>
+    <div id="cStore" class="storeinfo"></div>
+    <div class="row r2"><button id="cPause" class="pausebtn">Pause</button><button id="cStop">Stop</button></div>
+  </div>
+  <details id="cSet">
+    <summary>Claude settings</summary>
+    <label>API key (stays on this phone)<input id="cKey" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="sk-ant-…"></label>
+    <label>Instruction<textarea id="cInstr"></textarea></label>
+    <label>Effort<select id="cEffort"><option value="low">Low (fastest)</option><option value="medium">Medium</option><option value="high">High (best texts)</option></select></label>
+    <label>References (sent with every task): <span id="cRefCount">none</span></label>
+    <div class="row r2" style="padding: 6px 4px 0"><button id="cRefAdd">Add references</button><button id="cRefClear">Remove all</button></div>
+    <input id="cRefIn" type="file" accept="image/*" multiple hidden>
+    <div id="cRefs" class="thumbs small" style="padding: 6px 4px 0"></div>
+  </details>
 </div>
 
 <div id="more">
@@ -1059,6 +1115,8 @@ function showStoreInfo() {
   }
   el.textContent = text;
   el.classList.toggle("ready", ok);
+  const c = document.getElementById("cStore");   // (the Claude panel shows it too)
+  if (c) { c.textContent = text; c.classList.toggle("ready", ok); }
 }
 function setStoredReady(on) {
   if (on === storedReady) return;
@@ -1847,6 +1905,206 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("sw.js").catch(() => {});
 }
 window.addEventListener("pagehide", () => { if (connected) device.gatt.disconnect(); });
+
+// ---------------- write with Claude ----------------
+// Photos of a task (camera or gallery) + the saved reference images + the saved
+// instruction go to Claude; its answer lands in the Send text box, which is stored
+// on the Flipper as usual: Caps Lock on the PC types it, pauses and resumes.
+// The API key and references stay on this phone (localStorage / IndexedDB).
+const CLAUDE_MODEL = "claude-opus-5-5";
+const SDK_URL = "https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@1.7.0/+esm";
+const DEFAULT_INSTR = "okay dieser chat wird dafür da sein um english texte generieren zu lassen. ich habe dir alle references für context hochgeladen damit du weißt. der ablauf wird so sein, ich werde dir ein bild von einer aufgabe schicken oder direkt auch 2 oder 3 bilder wo man 2 oder einen text schreiben muss und du wirst mir als antwort einfach nur den text oder die texte nacheinander geben ohne irgendwas anderes also wirklich nur die texte";
+const TASK_EDGE = 2576, REF_EDGE = 1568;   // long edge in px: tasks full detail, references cheaper
+// Claude Opus 5.5, $ per million tokens: input, cache write (5 min), cache read, output
+const PRICE = { in: 4, write: 5, read: 0.2, out: 20 };
+let Anthropic = null, claudeTasks = [], claudeRefs = [], claudeBusy = null;
+
+function cMsg(text, kind = "") { const el = $("cMsg"); el.textContent = text || ""; el.className = "cmsg " + kind; }
+function lsGet(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+
+// Shrink a photo to JPEG (long edge max px) and return {b64, url}
+async function shrinkImage(file, maxEdge) {
+  const src = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error("Couldn't read " + (file.name || "the photo"))); i.src = src; });
+    const s = Math.min(1, maxEdge / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.max(1, Math.round(img.naturalWidth * s)), h = Math.max(1, Math.round(img.naturalHeight * s));
+    const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+    const cx = cv.getContext("2d"); cx.fillStyle = "#fff"; cx.fillRect(0, 0, w, h); cx.drawImage(img, 0, 0, w, h);
+    const url = cv.toDataURL("image/jpeg", 0.88);
+    return { b64: url.slice(url.indexOf(",") + 1), url };
+  } finally { URL.revokeObjectURL(src); }
+}
+
+function renderThumbs(el, list, onRemove) {
+  el.innerHTML = "";
+  list.forEach((it, i) => {
+    const d = document.createElement("div"), im = document.createElement("img"), x = document.createElement("button");
+    im.src = it.url; x.textContent = "×"; x.onclick = () => onRemove(i);
+    d.append(im, x); el.appendChild(d);
+  });
+}
+
+// ---- task photos
+function renderTasks() {
+  renderThumbs($("cTasks"), claudeTasks, (i) => { claudeTasks.splice(i, 1); renderTasks(); });
+  $("cGo").disabled = !!claudeBusy;
+  $("cGo").textContent = claudeBusy ? "Writing…" : "Write text";
+}
+async function addTasks(files) {
+  for (const f of files) {
+    try { claudeTasks.push(await shrinkImage(f, TASK_EDGE)); } catch (e) { cMsg(e.message, "bad"); }
+  }
+  renderTasks();
+  if (claudeTasks.length) cMsg(claudeTasks.length + (claudeTasks.length === 1 ? " photo" : " photos") + " of the task. Add more or tap Write text.");
+}
+$("cCam").onclick = () => $("cCamIn").click();
+$("cLib").onclick = () => $("cLibIn").click();
+$("cCamIn").onchange = async (e) => { await addTasks([...e.target.files]); e.target.value = ""; };
+$("cLibIn").onchange = async (e) => { await addTasks([...e.target.files]); e.target.value = ""; };
+$("cClear").onclick = () => { claudeTasks = []; renderTasks(); cMsg(""); };
+
+// ---- references (IndexedDB, on this phone)
+function refDb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open("phonekb-claude", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("refs", { keyPath: "id", autoIncrement: true });
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+}
+async function refTx(mode, fn) {
+  const db = await refDb();
+  return new Promise((res, rej) => {
+    const tx = db.transaction("refs", mode), st = tx.objectStore("refs"), out = fn(st);
+    tx.oncomplete = () => { db.close(); res(out && out.result); }; tx.onerror = () => { db.close(); rej(tx.error); };
+  });
+}
+async function loadRefs() {
+  try { claudeRefs = (await refTx("readonly", (st) => st.getAll())) || []; } catch (e) { claudeRefs = []; }
+  claudeRefs.forEach((r) => { r.url = "data:image/jpeg;base64," + r.b64; });
+  renderRefs();
+}
+function renderRefs() {
+  $("cRefCount").textContent = claudeRefs.length ? claudeRefs.length + (claudeRefs.length === 1 ? " image" : " images") : "none";
+  renderThumbs($("cRefs"), claudeRefs, async (i) => {
+    try { await refTx("readwrite", (st) => st.delete(claudeRefs[i].id)); } catch (e) {}
+    await loadRefs();
+  });
+}
+$("cRefAdd").onclick = () => $("cRefIn").click();
+$("cRefIn").onchange = async (e) => {
+  const files = [...e.target.files]; e.target.value = "";
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (_) {}
+  let n = 0;
+  for (const f of files) {
+    cMsg(`Saving references… ${++n}/${files.length}`);
+    try { const { b64 } = await shrinkImage(f, REF_EDGE); await refTx("readwrite", (st) => st.add({ name: f.name || "", b64 })); }
+    catch (err) { cMsg("Couldn't save a reference: " + err.message, "bad"); }
+  }
+  await loadRefs();
+  cMsg(`${claudeRefs.length} references saved on this phone.`, "good");
+};
+$("cRefClear").onclick = async () => {
+  if (!claudeRefs.length || !confirm(`Remove all ${claudeRefs.length} references from this phone?`)) return;
+  try { await refTx("readwrite", (st) => st.clear()); } catch (e) {}
+  await loadRefs();
+};
+
+// ---- settings
+(function () {
+  $("cKey").value = lsGet("phonekb.claudeKey", "");
+  $("cInstr").value = lsGet("phonekb.claudeInstr", DEFAULT_INSTR);
+  $("cEffort").value = lsGet("phonekb.claudeEffort", "high");
+  $("cKey").addEventListener("change", () => lsSet("phonekb.claudeKey", $("cKey").value.trim()));
+  $("cInstr").addEventListener("change", () => lsSet("phonekb.claudeInstr", $("cInstr").value.trim() ? $("cInstr").value : DEFAULT_INSTR));
+  $("cEffort").addEventListener("change", () => lsSet("phonekb.claudeEffort", $("cEffort").value));
+})();
+
+// ---- the text box (same as Send text's box: edits are stored on the Flipper again)
+$("cOut").addEventListener("input", () => { $("bulk").value = $("cOut").value; $("bulk").dispatchEvent(new Event("input")); });
+function setBoxText(text) {
+  $("bulk").value = text; $("cOut").value = text;
+  $("bulk").dispatchEvent(new Event("input"));   // a new text: store it on the Flipper (Caps Lock types it)
+  scheduleStore(50);
+}
+
+// ---- ask Claude
+async function writeWithClaude() {
+  if (claudeBusy) return;
+  const key = $("cKey").value.trim();
+  if (!key) { $("cSet").open = true; cMsg("Enter your Anthropic API key in Claude settings first.", "bad"); return; }
+  if (!claudeTasks.length) { cMsg("Take or pick at least one photo of the task first.", "bad"); return; }
+  lsSet("phonekb.claudeKey", key);
+  const ctl = { abort: null, cancelled: false }; claudeBusy = ctl; renderTasks();
+  cMsg("Loading…");
+  try {
+    if (!Anthropic) Anthropic = (await import(SDK_URL)).default;
+    const client = new Anthropic({ apiKey: key, dangerouslyAllowBrowser: true, maxRetries: 2 });
+    const img = (b64) => ({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } });
+    const content = [];
+    if (claudeRefs.length) {
+      content.push({ type: "text", text: "References (Kontext):" });
+      claudeRefs.forEach((r) => content.push(img(r.b64)));
+      content[content.length - 1].cache_control = { type: "ephemeral" };   // same every time: cached, ~1/20 of the price
+    }
+    content.push({ type: "text", text: claudeTasks.length === 1 ? "Aufgabe:" : `Aufgabe (${claudeTasks.length} Bilder):` });
+    claudeTasks.forEach((t) => content.push(img(t.b64)));
+    const stream = client.beta.messages.stream({
+      model: CLAUDE_MODEL,
+      max_tokens: 32000,
+      betas: ["server-side-fallback-2026-07-01"],
+      fallbacks: "default",   // if Opus declines, the API retries on a fallback model
+      output_config: { effort: $("cEffort").value || "high" },
+      system: $("cInstr").value.trim() || DEFAULT_INSTR,
+      messages: [{ role: "user", content }],
+    });
+    ctl.abort = () => stream.abort();
+    let written = "";
+    cMsg("Claude is thinking… keep this page open (about 20–60 s).");
+    stream.on("text", (d) => {
+      written += d;
+      const words = written.trim().split(/\s+/).length;
+      cMsg(`Claude is writing… ${words} words`); $("cOut").value = written;
+    });
+    const msg = await stream.finalMessage();
+    if (msg.stop_reason === "refusal") throw new Error("Claude declined this task" + (msg.stop_details && msg.stop_details.explanation ? ": " + msg.stop_details.explanation : "."));
+    const text = msg.content.filter((b) => b.type === "text").map((b) => b.text).join("").trim();
+    if (!text) throw new Error("Claude sent no text back. Try again.");
+    setBoxText(text);
+    const u = msg.usage || {}, cost = ((u.input_tokens || 0) * PRICE.in + (u.cache_creation_input_tokens || 0) * PRICE.write +
+      (u.cache_read_input_tokens || 0) * PRICE.read + (u.output_tokens || 0) * PRICE.out) / 1e6;
+    const words = text.split(/\s+/).length;
+    cMsg(`Done: ${words} words (≈ $${cost.toFixed(2)})` + (msg.stop_reason === "max_tokens" ? " — cut off at the length limit!" : "") +
+      (connected ? ". Press Caps Lock on the PC to type it." : ". Connect to the Flipper to store it."), msg.stop_reason === "max_tokens" ? "bad" : "good");
+  } catch (e) {
+    if (ctl.cancelled) { cMsg("Cancelled."); }
+    else if (Anthropic && e instanceof Anthropic.AuthenticationError) cMsg("The API key was rejected. Check it in Claude settings.", "bad");
+    else if (Anthropic && e instanceof Anthropic.PermissionDeniedError) cMsg("This API key isn't allowed to use " + CLAUDE_MODEL + ".", "bad");
+    else if (Anthropic && e instanceof Anthropic.RateLimitError) cMsg("Too many requests or no credit left on the API account. Wait a moment, or check billing.", "bad");
+    else if (Anthropic && e instanceof Anthropic.BadRequestError) cMsg("Claude couldn't take the request: " + e.message, "bad");
+    else if (Anthropic && e instanceof Anthropic.APIConnectionError) cMsg("No connection to Claude. Check the internet and try again.", "bad");
+    else if (Anthropic && e instanceof Anthropic.APIError) cMsg("Claude had a problem (" + (e.status || "error") + "). Try again.", "bad");
+    else cMsg(String((e && e.message) || e), "bad");
+  } finally {
+    claudeBusy = null; renderTasks();
+  }
+}
+$("cGo").onclick = writeWithClaude;
+$("cStop").onclick = () => {
+  if (claudeBusy) { claudeBusy.cancelled = true; if (claudeBusy.abort) claudeBusy.abort(); return; }
+  $("stopBulk").click();
+};
+$("cPause").onclick = togglePause;
+$("claudeBtn").onclick = () => {
+  $("cOut").value = $("bulk").value; showStoreInfo(); renderTasks();
+  $("cdot").classList.toggle("on", connected);
+  if (!$("cKey").value) $("cSet").open = true;
+  $("cpanel").classList.add("open");
+};
+$("cclose").onclick = () => $("cpanel").classList.remove("open");
+setInterval(() => { if ($("cpanel").classList.contains("open")) $("cdot").classList.toggle("on", connected); }, 1000);
+loadRefs();
 </script>
 </body>
 </html>
