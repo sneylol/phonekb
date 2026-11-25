@@ -145,6 +145,16 @@
   #cSet input, #cSet select { font: inherit; font-size: 16px; width: 100%; margin-top: 4px; padding: 9px; border-radius: 8px;
     border: 1px solid #333843; background: var(--panel); color: var(--text); }
   #cInstr { height: 120px; margin-top: 4px; font-size: 14px; }
+  /* screen lock while Claude writes: nothing behind it can be tapped by accident */
+  #cLock { display: none; position: fixed; inset: 0; z-index: 30; background: rgba(10, 11, 14, .94);
+    flex-direction: column; align-items: center; justify-content: center; gap: 22px; padding: 24px; touch-action: none; }
+  #cLock.open { display: flex; }
+  #cLock .lk { font-size: 40px; }
+  #cLockMsg { color: var(--text); font-size: 16px; text-align: center; max-width: 320px; min-height: 44px; }
+  #cLockHold { position: relative; overflow: hidden; width: 230px; padding: 16px 0; border-radius: 12px; font-size: 15px; color: var(--muted); }
+  #cLockHold span { position: relative; }
+  #cLockHold i { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: #5a2323; transition: none; }
+  #cLockHold.holding i { width: 100%; transition: width 1.5s linear; }
 </style>
 </head>
 <body>
@@ -265,6 +275,12 @@
   <button data-key="79">→</button>
   <button data-key="76">Del</button>
   <button id="moreBtn">⋯</button>
+</div>
+
+<div id="cLock">
+  <div class="lk">🔒</div>
+  <div id="cLockMsg"></div>
+  <button id="cLockHold"><i></i><span>Hold to cancel</span></button>
 </div>
 
 <div id="cpanel">
@@ -1946,7 +1962,27 @@ const TASK_EDGE = 2576, REF_EDGE = 1568;   // long edge in px: tasks full detail
 const PRICE = { in: 4, write: 5, read: 0.2, out: 20 };
 let Anthropic = null, claudeTasks = [], claudeRefs = [], claudeBusy = null;
 
-function cMsg(text, kind = "") { const el = $("cMsg"); el.textContent = text || ""; el.className = "cmsg " + kind; }
+function cMsg(text, kind = "") {
+  const el = $("cMsg"); el.textContent = text || ""; el.className = "cmsg " + kind;
+  $("cLockMsg").textContent = text || "";   // (shown on the lock screen too)
+}
+// Lock screen while Claude writes: covers the whole page, so a stray tap does nothing.
+// It opens with Write text and closes by itself when the text is there (or on an error).
+// Cancelling needs the button held for 1.5 s.
+function lockScreen(on) { $("cLock").classList.toggle("open", on); if (!on) $("cLockHold").classList.remove("holding"); }
+(function () {
+  const lock = $("cLock"), hold = $("cLockHold");
+  let timer = null;
+  const stop = () => { clearTimeout(timer); timer = null; hold.classList.remove("holding"); };
+  hold.addEventListener("pointerdown", (e) => {
+    e.preventDefault(); stop(); void hold.offsetWidth; hold.classList.add("holding");
+    timer = setTimeout(() => { stop(); if (claudeBusy) { claudeBusy.cancelled = true; if (claudeBusy.abort) claudeBusy.abort(); } }, 1500);
+  });
+  ["pointerup", "pointerleave", "pointercancel"].forEach((t) => hold.addEventListener(t, stop));
+  // swallow everything else: no scrolling, zooming or taps through the lock
+  ["touchstart", "touchmove", "touchend", "wheel"].forEach((t) => lock.addEventListener(t, (e) => { if (e.target !== hold && e.cancelable) e.preventDefault(); }, { passive: false }));
+  lock.addEventListener("contextmenu", (e) => e.preventDefault());
+})();
 function lsGet(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } }
 function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 
@@ -2064,6 +2100,7 @@ async function writeWithClaude() {
   if (!claudeTasks.length) { cMsg("Take or pick at least one photo of the task first.", "bad"); return; }
   lsSet("phonekb.claudeKey", key);
   const ctl = { abort: null, cancelled: false }; claudeBusy = ctl; renderTasks();
+  lockScreen(true);
   cMsg("Loading…");
   try {
     if (!Anthropic) Anthropic = (await import(SDK_URL)).default;
@@ -2087,6 +2124,7 @@ async function writeWithClaude() {
       messages: [{ role: "user", content }],
     });
     ctl.abort = () => stream.abort();
+    if (ctl.cancelled) stream.abort();   // cancelled while loading
     let written = "";
     cMsg("Claude is thinking… keep this page open (about 20–60 s).");
     stream.on("text", (d) => {
@@ -2115,6 +2153,7 @@ async function writeWithClaude() {
     else cMsg(String((e && e.message) || e), "bad");
   } finally {
     claudeBusy = null; renderTasks();
+    lockScreen(false);
   }
 }
 $("cGo").onclick = writeWithClaude;
