@@ -1977,6 +1977,7 @@ function plainText(s) {
     .trim();
 }
 function todayText() { return new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" }); }
+const WEB_MAX_WORDS = 200;   // a task this short (and no photos) may name a text instead of giving it
 const TASK_EDGE = 2576, REF_EDGE = 1568;   // long edge in px: tasks full detail, references cheaper
 // Claude Opus 5.5, $ per million tokens: input, cache write (5 min), cache read, output
 const PRICE = { in: 4, write: 5, read: 0.2, out: 20 };
@@ -2292,10 +2293,12 @@ async function writeWithClaude() {
       fallbacks: "default",   // if Opus declines, the API retries on a fallback model
       output_config: { effort: $("cEffort").value || "high" },
       system: ($("cInstr").value.trim() || DEFAULT_INSTR) + "\n\n" + FORMAT_RULE + "\n\n" + SOURCE_RULE,
-      // Web search: only used when the task names a text without giving it (see SOURCE_RULE)
-      tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 5 }, { type: "web_fetch_20260209", name: "web_fetch", max_uses: 4 }],
       messages: [{ role: "user", content }],
     };
+    // Web search only for a short typed task without photos (it names a text instead of giving it).
+    // With photos or a pasted text Claude can't go online at all, so it can't pull in the full original.
+    if (!claudeTasks.length && taskText.split(/\s+/).length <= WEB_MAX_WORDS)
+      params.tools = [{ type: "web_search_20260209", name: "web_search", max_uses: 5 }, { type: "web_fetch_20260209", name: "web_fetch", max_uses: 4 }];
     const usage = { in: 0, write: 0, read: 0, out: 0, searches: 0 };
     let all = [], msg = null, written = "";
     cMsg("Claude is thinking… keep this page open (about 20–60 s).");
