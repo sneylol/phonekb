@@ -1943,7 +1943,20 @@ const FORMAT_RULE = "Output format: plain text only, exactly as it will be typed
   "Put each heading or subheading on its own line as plain words. Simple '- ' list items are fine where the text type needs a list. " +
   "If you write more than one text, separate them with two empty lines. " +
   "Never leave placeholders such as 20__, __, [Name] or XX: fill in suitable details yourself. " +
-  "If a date is needed and the task doesn't give one, use today's date, which is given in the message.";
+  "If a date is needed and the task doesn't give one, use today's date, which is given in the message. " +
+  "End with the last sentence of the text itself: no word count (e.g. 'Wortanzahl: 640'), no notes or comments before or after it.";
+// Which text to work with: only the one given in the task (an excerpt stays an excerpt)
+const SOURCE_RULE = "Source text: work only with the text given in the task (on the photos or typed in). " +
+  "Passages left out there with (…), […], (...) or [...] are not part of the text: do not summarise, quote or mention them, " +
+  "even if you know the full original, find it online or see it in a reference. " +
+  "The references are only models for structure, style and phrasing: never take content or quotations from a reference " +
+  "unless they also appear in the given text. Quote word for word exactly as printed in the given text (keep its spelling). " +
+  "Give line numbers (Z.) only if the given text shows line numbers; otherwise refer to paragraphs (Abs.). " +
+  "Web search: use it only if the task names a text without giving the text itself, or if the task explicitly asks you to search. " +
+  "Then look for exactly the version named (author, date, source, translation) and work with that. " +
+  "Never mention the search, sources or links in your answer.";
+// A word count line at the end ("Wortanzahl: 640", "(ca. 640 Wörter)", "Word count: 250")
+const WORDCOUNT_END = /(\n[ \t]*\(?[ \t]*(?:(?:wortanzahl|wortzahl|anzahl der wörter|wörter|word count|words)[ \t]*[:：]?[ \t]*(?:ca\.?|circa|etwa|~)?[ \t]*\d{2,5}(?:[ \t]*(?:wörter|words))?|(?:ca\.?|circa|etwa|~)?[ \t]*\d{2,5}[ \t]*(?:wörter|words))[ \t]*\)?[ \t]*\.?[ \t]*)+\s*$/i;
 // Remove Markdown that still comes back (Claude's answer is typed character by character)
 function plainText(s) {
   const year = String(new Date().getFullYear());
@@ -1958,6 +1971,7 @@ function plainText(s) {
     .replace(/`([^`\n]+)`/g, "$1")                          // `code`
     .replace(/\*\*/g, "")                                   // stray **
     .replace(/\b20__\b/g, year)                             // a year left blank
+    .replace(WORDCOUNT_END, "")                              // "Wortanzahl: 640" at the end
     .replace(/[ \t]+$/gm, "")
     .replace(/\n{4,}/g, "\n\n\n")
     .trim();
@@ -2271,33 +2285,54 @@ async function writeWithClaude() {
     content.push({ type: "text", text: `Today's date: ${todayText()}.\nAufgabe${photos}:` });
     claudeTasks.forEach((t) => content.push(img(t.b64)));
     if (taskText) content.push({ type: "text", text: (claudeTasks.length ? "Aufgabe (Text, zusätzlich zu den Bildern):\n" : "") + taskText });
-    const stream = client.beta.messages.stream({
+    const params = {
       model: CLAUDE_MODEL,
       max_tokens: 32000,
       betas: ["server-side-fallback-2026-07-01"],
       fallbacks: "default",   // if Opus declines, the API retries on a fallback model
       output_config: { effort: $("cEffort").value || "high" },
-      system: ($("cInstr").value.trim() || DEFAULT_INSTR) + "\n\n" + FORMAT_RULE,
+      system: ($("cInstr").value.trim() || DEFAULT_INSTR) + "\n\n" + FORMAT_RULE + "\n\n" + SOURCE_RULE,
+      // Web search: only used when the task names a text without giving it (see SOURCE_RULE)
+      tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 5 }, { type: "web_fetch_20260209", name: "web_fetch", max_uses: 4 }],
       messages: [{ role: "user", content }],
-    });
-    ctl.abort = () => stream.abort();
-    if (ctl.cancelled) stream.abort();   // cancelled while loading
-    let written = "";
+    };
+    const usage = { in: 0, write: 0, read: 0, out: 0, searches: 0 };
+    let all = [], msg = null, written = "";
     cMsg("Claude is thinking… keep this page open (about 20–60 s).");
-    stream.on("text", (d) => {
-      written += d;
-      const words = written.trim().split(/\s+/).length;
-      cMsg(`Claude is writing… ${words} words`); $("cOut").value = written;
-    });
-    const msg = await stream.finalMessage();
+    for (let round = 1; ; round++) {
+      const stream = client.beta.messages.stream(params);
+      ctl.abort = () => stream.abort();
+      if (ctl.cancelled) stream.abort();   // cancelled while loading
+      stream.on("streamEvent", (ev) => {
+        if (ev.type !== "content_block_start") return;
+        const t = ev.content_block && ev.content_block.type;
+        if (t === "server_tool_use") { written = ""; cMsg("Claude is searching online for the text…"); }
+        else if (t && /tool_result$/.test(t)) { written = ""; cMsg("Claude is reading what it found…"); }
+      });
+      stream.on("text", (d) => {
+        written += d;
+        cMsg(`Claude is writing… ${written.trim().split(/\s+/).length} words`); $("cOut").value = written;
+      });
+      msg = await stream.finalMessage();
+      const u = msg.usage || {};
+      usage.in += u.input_tokens || 0; usage.write += u.cache_creation_input_tokens || 0;
+      usage.read += u.cache_read_input_tokens || 0; usage.out += u.output_tokens || 0;
+      usage.searches += (u.server_tool_use && u.server_tool_use.web_search_requests) || 0;
+      all = all.concat(msg.content);
+      // A long search can pause the turn: send it back so Claude carries on
+      if (msg.stop_reason !== "pause_turn" || round >= 5) break;
+      params.messages = params.messages.concat([{ role: "assistant", content: msg.content }]);
+    }
     if (msg.stop_reason === "refusal") throw new Error("Claude declined this task" + (msg.stop_details && msg.stop_details.explanation ? ": " + msg.stop_details.explanation : "."));
-    const text = plainText(msg.content.filter((b) => b.type === "text").map((b) => b.text).join(""));
+    // The answer is the text after the last search (anything before it is Claude talking to itself)
+    let last = -1;
+    all.forEach((blk, i) => { if (blk.type === "server_tool_use" || /tool_result$/.test(blk.type)) last = i; });
+    const text = plainText(all.slice(last + 1).filter((blk) => blk.type === "text").map((blk) => blk.text).join(""));
     if (!text) throw new Error("Claude sent no text back. Try again.");
     setBoxText(text);
-    const u = msg.usage || {}, cost = ((u.input_tokens || 0) * PRICE.in + (u.cache_creation_input_tokens || 0) * PRICE.write +
-      (u.cache_read_input_tokens || 0) * PRICE.read + (u.output_tokens || 0) * PRICE.out) / 1e6;
+    const cost = (usage.in * PRICE.in + usage.write * PRICE.write + usage.read * PRICE.read + usage.out * PRICE.out) / 1e6 + usage.searches * 0.01;
     const words = text.split(/\s+/).length;
-    cMsg(`Done: ${words} words (≈ $${cost.toFixed(2)})` + (msg.stop_reason === "max_tokens" ? " — cut off at the length limit!" : "") +
+    cMsg(`Done: ${words} words (≈ $${cost.toFixed(2)}${usage.searches ? `, searched online ${usage.searches}×` : ""})` + (msg.stop_reason === "max_tokens" ? " — cut off at the length limit!" : "") +
       (connected ? ". Press Caps Lock on the PC to type it." : ". Connect to the Flipper to store it."), msg.stop_reason === "max_tokens" ? "bad" : "good");
   } catch (e) {
     if (ctl.cancelled) { cMsg("Cancelled."); }
