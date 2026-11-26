@@ -143,6 +143,7 @@
   .cmsg.bad { color: var(--bad); }
   .cmsg.good { color: var(--ok); }
   #cOut { height: 220px; margin-top: 6px; }
+  #cTaskText { height: 90px; margin-top: 6px; font-size: 16px; }
   #cSet { margin: 14px 8px 0; border-top: 1px solid #23262d; padding-top: 8px; }
   #cSet summary { color: var(--muted); font-size: 14px; padding: 6px 4px; }
   #cSet label { display: block; color: var(--muted); font-size: 13px; padding: 8px 4px 0; }
@@ -290,12 +291,13 @@
 <div id="cpanel">
   <header><div class="rdot" id="cdot"></div><b style="flex:1">Write with Claude</b><button id="cclose" style="padding:8px 16px">Done</button></header>
   <div class="csec">
-    <h4>Task (photos)</h4>
+    <h4>Task (photos, text or both)</h4>
     <div class="row r2"><button id="cCam">📷 Camera</button><button id="cLib">🖼 Photos</button></div>
     <input id="cCamIn" type="file" accept="image/*" capture="environment" hidden>
     <input id="cLibIn" type="file" accept="image/*" multiple hidden>
     <div id="cTasks" class="thumbs"></div>
-    <div class="row r2"><button id="cGo">Write text</button><button id="cClear">Clear photos</button></div>
+    <textarea id="cTaskText" placeholder="Type or paste the task here (optional: alone or together with photos)"></textarea>
+    <div class="row r2"><button id="cGo">Write text</button><button id="cClear">Clear task</button></div>
     <div id="cMsg" class="cmsg"></div>
   </div>
   <div class="csec">
@@ -2036,7 +2038,7 @@ $("cCam").onclick = () => $("cCamIn").click();
 $("cLib").onclick = () => $("cLibIn").click();
 $("cCamIn").onchange = async (e) => { await addTasks([...e.target.files]); e.target.value = ""; };
 $("cLibIn").onchange = async (e) => { await addTasks([...e.target.files]); e.target.value = ""; };
-$("cClear").onclick = () => { claudeTasks = []; renderTasks(); cMsg(""); };
+$("cClear").onclick = () => { claudeTasks = []; $("cTaskText").value = ""; renderTasks(); cMsg(""); };
 
 // ---- reading reference files of any kind
 // Images -> JPEG, PDF -> as is (Claude reads text and pictures), Word / PowerPoint /
@@ -2246,7 +2248,8 @@ async function writeWithClaude() {
   if (claudeBusy) return;
   const key = $("cKey").value.trim();
   if (!key) { $("cSet").open = true; cMsg("Enter your Anthropic API key in Claude settings first.", "bad"); return; }
-  if (!claudeTasks.length) { cMsg("Take or pick at least one photo of the task first.", "bad"); return; }
+  const taskText = $("cTaskText").value.trim();
+  if (!claudeTasks.length && !taskText) { cMsg("Add the task first: take or pick a photo, or type it in the box.", "bad"); return; }
   lsSet("phonekb.claudeKey", key);
   const ctl = { abort: null, cancelled: false }; claudeBusy = ctl; renderTasks();
   lockScreen(true);
@@ -2264,8 +2267,10 @@ async function writeWithClaude() {
         img(r.b64)));
       content[content.length - 1].cache_control = { type: "ephemeral" };   // same every time: cached, ~1/20 of the price
     }
-    content.push({ type: "text", text: `Today's date: ${todayText()}.\n` + (claudeTasks.length === 1 ? "Aufgabe:" : `Aufgabe (${claudeTasks.length} Bilder):`) });
+    const photos = claudeTasks.length === 0 ? "" : claudeTasks.length === 1 ? " (Bild)" : ` (${claudeTasks.length} Bilder)`;
+    content.push({ type: "text", text: `Today's date: ${todayText()}.\nAufgabe${photos}:` });
     claudeTasks.forEach((t) => content.push(img(t.b64)));
+    if (taskText) content.push({ type: "text", text: (claudeTasks.length ? "Aufgabe (Text, zusätzlich zu den Bildern):\n" : "") + taskText });
     const stream = client.beta.messages.stream({
       model: CLAUDE_MODEL,
       max_tokens: 32000,
