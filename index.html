@@ -129,8 +129,12 @@
   .csec .row { padding: 6px 0 0; }
   .thumbs { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 6px; }
   .thumbs div { position: relative; width: 72px; height: 72px; border-radius: 8px; overflow: hidden; background: var(--panel); }
-  .thumbs.small div { width: 48px; height: 48px; }
+  .thumbs.small div { width: 56px; height: 56px; }
+  .thumbs.small button { width: 18px; height: 18px; line-height: 18px; font-size: 11px; }
   .thumbs img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .thumbs .file { display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding: 22px 2px 2px;
+    font-size: 9px; line-height: 1.1; color: var(--muted); text-align: center; word-break: break-all; }
+  .thumbs .file b { font-size: 10px; color: var(--key-active); }
   .thumbs button { position: absolute; top: 2px; right: 2px; padding: 0; width: 22px; height: 22px; border-radius: 11px;
     background: rgba(0,0,0,.7); font-size: 13px; line-height: 22px; }
   #cGo { background: var(--key-active); color: #111; font-weight: 600; }
@@ -305,9 +309,9 @@
     <label>API key (stays on this phone)<input id="cKey" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="sk-ant-…"></label>
     <label>Instruction<textarea id="cInstr"></textarea></label>
     <label>Effort<select id="cEffort"><option value="low">Low (fastest)</option><option value="medium">Medium</option><option value="high">High (best texts)</option></select></label>
-    <label>References (sent with every task): <span id="cRefCount">none</span></label>
+    <label>References (sent with every task; images, PDF, Word, PowerPoint, Excel, text…): <span id="cRefCount">none</span></label>
     <div class="row r2" style="padding: 6px 4px 0"><button id="cRefAdd">Add references</button><button id="cRefClear">Remove all</button></div>
-    <input id="cRefIn" type="file" accept="image/*" multiple hidden>
+    <input id="cRefIn" type="file" multiple hidden>
     <div id="cRefs" class="thumbs small" style="padding: 6px 4px 0"></div>
   </details>
 </div>
@@ -2003,9 +2007,15 @@ async function shrinkImage(file, maxEdge) {
 function renderThumbs(el, list, onRemove) {
   el.innerHTML = "";
   list.forEach((it, i) => {
-    const d = document.createElement("div"), im = document.createElement("img"), x = document.createElement("button");
-    im.src = it.url; x.textContent = "×"; x.onclick = () => onRemove(i);
-    d.append(im, x); el.appendChild(d);
+    const d = document.createElement("div"), x = document.createElement("button");
+    if (it.url) { const im = document.createElement("img"); im.src = it.url; d.appendChild(im); }
+    else {   // a document: its type and name
+      d.className = "file"; d.title = it.name || "";
+      const b = document.createElement("b"); b.textContent = it.kind === "pdf" ? "PDF" : "TEXT";
+      d.append(b, document.createTextNode((it.name || "").slice(0, 24)));
+    }
+    x.textContent = "×"; x.onclick = () => onRemove(i);
+    d.appendChild(x); el.appendChild(d);
   });
 }
 
@@ -2028,6 +2038,140 @@ $("cCamIn").onchange = async (e) => { await addTasks([...e.target.files]); e.tar
 $("cLibIn").onchange = async (e) => { await addTasks([...e.target.files]); e.target.value = ""; };
 $("cClear").onclick = () => { claudeTasks = []; renderTasks(); cMsg(""); };
 
+// ---- reading reference files of any kind
+// Images -> JPEG, PDF -> as is (Claude reads text and pictures), Word / PowerPoint /
+// Excel / OpenDocument / EPUB -> their text, text-like files (txt, md, csv, html, rtf…) -> text.
+const PDF_MAX = 30 * 1024 * 1024, TEXT_MAX = 2 * 1024 * 1024;
+function fileExt(name) { const m = /\.([a-z0-9]+)$/i.exec(name || ""); return m ? m[1].toLowerCase() : ""; }
+function bytesToB64(u8) { let s = ""; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); }
+function xmlEntities(s) {
+  return s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (m, d) => String.fromCodePoint(+d)).replace(/&#x([0-9a-f]+);/gi, (m, h) => String.fromCodePoint(parseInt(h, 16))).replace(/&amp;/g, "&");
+}
+// Minimal ZIP reader (docx, pptx, xlsx, odt, epub are ZIP files)
+async function unzip(buf) {
+  const dv = new DataView(buf), u8 = new Uint8Array(buf), files = {};
+  let eocd = -1;
+  for (let i = u8.length - 22; i >= Math.max(0, u8.length - 65557); i--) if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  if (eocd < 0) throw new Error("not a ZIP-based file");
+  let p = dv.getUint32(eocd + 16, true);
+  const count = dv.getUint16(eocd + 10, true), dec = new TextDecoder();
+  for (let k = 0; k < count && dv.getUint32(p, true) === 0x02014b50; k++) {
+    const method = dv.getUint16(p + 10, true), size = dv.getUint32(p + 20, true);
+    const nl = dv.getUint16(p + 28, true), xl = dv.getUint16(p + 30, true), cl = dv.getUint16(p + 32, true), off = dv.getUint32(p + 42, true);
+    const name = dec.decode(u8.subarray(p + 46, p + 46 + nl));
+    files[name] = async () => {
+      const start = off + 30 + dv.getUint16(off + 26, true) + dv.getUint16(off + 28, true), data = u8.subarray(start, start + size);
+      if (method === 0) return dec.decode(data);
+      if (method !== 8) throw new Error("unsupported compression");
+      const out = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+      return dec.decode(await new Response(out).arrayBuffer());
+    };
+    p += 46 + nl + xl + cl;
+  }
+  return files;
+}
+const byNumber = (a, b) => (+(/(\d+)\D*$/.exec(a) || [0, 0])[1]) - (+(/(\d+)\D*$/.exec(b) || [0, 0])[1]);
+function xmlText(xml, paraEnd) {   // paragraphs -> lines, tags removed
+  return xmlEntities(xml.replace(paraEnd, "\n").replace(/<(w:tab|text:tab)\/>/g, "\t").replace(/<(w:br|a:br|text:line-break)\b[^>]*\/>/g, "\n").replace(/<[^>]+>/g, ""));
+}
+async function officeText(buf, ext) {
+  const z0 = await unzip(buf), names = Object.keys(z0);
+  const z = new Proxy(z0, { get: (t, n) => t[n] || (() => { throw new Error("the file looks damaged (" + String(n) + " missing)"); }) });
+  if (ext === "docx" || ext === "docm" || ext === "dotx") return xmlText(await z["word/document.xml"](), /<\/w:p>/g);
+  if (ext === "pptx" || ext === "ppsx") {
+    const slides = names.filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n)).sort(byNumber), out = [];
+    for (let i = 0; i < slides.length; i++) out.push(`[Slide ${i + 1}]\n` + xmlText(await z[slides[i]](), /<\/a:p>/g).trim());
+    return out.join("\n\n");
+  }
+  if (ext === "xlsx" || ext === "xlsm") {
+    const shared = z0["xl/sharedStrings.xml"] ? [...(await z["xl/sharedStrings.xml"]()).matchAll(/<si>([\s\S]*?)<\/si>/g)].map((m) => xmlText(m[1], /$^/g)) : [];
+    const sheets = names.filter((n) => /^xl\/worksheets\/sheet\d+\.xml$/.test(n)).sort(byNumber), out = [];
+    for (let i = 0; i < sheets.length; i++) {
+      const rows = [...(await z[sheets[i]]()).matchAll(/<row\b[^>]*>([\s\S]*?)<\/row>/g)].map((r) =>
+        [...r[1].matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)].map((c) => {
+          const t = /\bt="(\w+)"/.exec(c[1]), v = /<v>([\s\S]*?)<\/v>/.exec(c[2] || ""), is = /<is>([\s\S]*?)<\/is>/.exec(c[2] || "");
+          if (t && t[1] === "s" && v) return shared[+v[1]] || "";
+          if (is) return xmlText(is[1], /$^/g);
+          return v ? xmlEntities(v[1]) : "";
+        }).join("\t"));
+      out.push(`[Sheet ${i + 1}]\n` + rows.join("\n"));
+    }
+    return out.join("\n\n");
+  }
+  if (["odt", "odp", "ods", "ott"].includes(ext)) return xmlText(await z["content.xml"](), /<\/text:(p|h)>/g);
+  if (ext === "epub") {
+    const parts = names.filter((n) => /\.x?html?$/i.test(n)).sort(), out = [];
+    for (const n of parts) out.push(htmlText(await z[n]()));
+    return out.join("\n\n");
+  }
+  throw new Error("unknown Office type");
+}
+function htmlText(html) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  doc.querySelectorAll("script,style").forEach((e) => e.remove());
+  doc.querySelectorAll("br").forEach((e) => e.replaceWith("\n"));
+  doc.querySelectorAll("p,div,li,h1,h2,h3,h4,h5,h6,tr").forEach((e) => e.append("\n"));
+  return (doc.body ? doc.body.textContent : "").replace(/\n{3,}/g, "\n\n");
+}
+function rtfText(rtf) {   // small RTF reader: text, paragraphs, special and Unicode characters
+  const SKIP = /^(fonttbl|colortbl|stylesheet|info|pict|object|header|footer|headerl|headerr|footerl|footerr|expandedcolortbl|listtable|listoverridetable|rsidtbl|generator|themedata|colorschememapping|datastore|latentstyles|xmlnstbl|mmathPr)$/;
+  const SPECIAL = { emdash: "—", endash: "–", lquote: "‘", rquote: "’", ldblquote: "“", rdblquote: "”", bullet: "•", par: "\n", line: "\n", sect: "\n", page: "\n", tab: "\t" };
+  const cp1252 = new TextDecoder("windows-1252");
+  let out = "", i = 0, uc = 1, pending = 0;
+  const skip = [false], skipping = () => skip[skip.length - 1];
+  const put = (t) => { if (skipping()) return; if (pending > 0) { pending--; return; } out += t; };
+  while (i < rtf.length) {
+    const c = rtf[i];
+    if (c === "{") { skip.push(skipping()); i++; continue; }
+    if (c === "}") { if (skip.length > 1) skip.pop(); i++; continue; }
+    if (c === "\r" || c === "\n") { i++; continue; }
+    if (c !== "\\") { put(c); i++; continue; }
+    const n = rtf[i + 1];
+    if (n === "\\" || n === "{" || n === "}") { put(n); i += 2; continue; }
+    if (n === "\n" || n === "\r") { if (!skipping()) out += "\n"; i += 2; continue; }
+    if (n === "*") { skip[skip.length - 1] = true; i += 2; continue; }
+    if (n === "~") { put(" "); i += 2; continue; }
+    if (n === "'") { put(cp1252.decode(new Uint8Array([parseInt(rtf.substr(i + 2, 2), 16) || 32]))); i += 4; continue; }
+    const m = /^\\([a-zA-Z]+)(-?\d+)? ?/.exec(rtf.slice(i, i + 48));
+    if (!m) { i += 2; continue; }
+    i += m[0].length;
+    const w = m[1];
+    if (SKIP.test(w)) { skip[skip.length - 1] = true; continue; }
+    if (skipping()) continue;
+    if (w === "uc") uc = +m[2] || 0;
+    else if (w === "u") { let cp = +m[2]; if (cp < 0) cp += 65536; out += String.fromCharCode(cp); pending = uc; }
+    else if (SPECIAL[w]) { pending = 0; out += SPECIAL[w]; }
+  }
+  return out;
+}
+const IMAGE_EXT = ["jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp", "tif", "tiff", "avif"];
+const OFFICE_EXT = ["docx", "docm", "dotx", "pptx", "ppsx", "xlsx", "xlsm", "odt", "odp", "ods", "ott", "epub"];
+async function readReference(f) {
+  const ext = fileExt(f.name), type = f.type || "", name = f.name || "file";
+  if (type.startsWith("image/") || IMAGE_EXT.includes(ext)) {
+    const { b64 } = await shrinkImage(f, REF_EDGE);
+    return { kind: "image", name, b64 };
+  }
+  if (type === "application/pdf" || ext === "pdf") {
+    if (f.size > PDF_MAX) throw new Error("PDF too big (max 30 MB)");
+    return { kind: "pdf", name, b64: bytesToB64(new Uint8Array(await f.arrayBuffer())) };
+  }
+  let text;
+  if (OFFICE_EXT.includes(ext)) text = await officeText(await f.arrayBuffer(), ext);
+  else if (["doc", "ppt", "xls", "pages", "key", "numbers"].includes(ext)) throw new Error("this format can't be read here: save it as PDF or .docx and add that");
+  else {
+    if (f.size > TEXT_MAX) throw new Error("file too big (max 2 MB of text)");
+    const raw = await f.text();
+    if (/[\u0000-\u0008\u000E-\u001A]/.test(raw.slice(0, 4000)) || (raw.match(/�/g) || []).length > 20)
+      throw new Error("not a readable document (try PDF, Word, text or an image)");
+    text = ext === "html" || ext === "htm" || type === "text/html" ? htmlText(raw) : ext === "rtf" ? rtfText(raw) : raw;
+  }
+  text = text.replace(/\r\n?/g, "\n").replace(/[ \t]+\n/g, "\n").replace(/\n{4,}/g, "\n\n\n").trim();
+  if (!text) throw new Error("no text found in it");
+  return { kind: "text", name, text };
+}
+
 // ---- references (IndexedDB, on this phone)
 function refDb() {
   return new Promise((res, rej) => {
@@ -2045,11 +2189,15 @@ async function refTx(mode, fn) {
 }
 async function loadRefs() {
   try { claudeRefs = (await refTx("readonly", (st) => st.getAll())) || []; } catch (e) { claudeRefs = []; }
-  claudeRefs.forEach((r) => { r.url = "data:image/jpeg;base64," + r.b64; });
+  claudeRefs.forEach((r) => { if (!r.kind) r.kind = "image"; if (r.kind === "image") r.url = "data:image/jpeg;base64," + r.b64; });
   renderRefs();
 }
 function renderRefs() {
-  $("cRefCount").textContent = claudeRefs.length ? claudeRefs.length + (claudeRefs.length === 1 ? " image" : " images") : "none";
+  const n = (k) => claudeRefs.filter((r) => r.kind === k).length, parts = [];
+  if (n("image")) parts.push(n("image") + (n("image") === 1 ? " image" : " images"));
+  if (n("pdf")) parts.push(n("pdf") + " PDF");
+  if (n("text")) parts.push(n("text") + (n("text") === 1 ? " document" : " documents"));
+  $("cRefCount").textContent = parts.length ? parts.join(", ") : "none";
   renderThumbs($("cRefs"), claudeRefs, async (i) => {
     try { await refTx("readwrite", (st) => st.delete(claudeRefs[i].id)); } catch (e) {}
     await loadRefs();
@@ -2059,14 +2207,15 @@ $("cRefAdd").onclick = () => $("cRefIn").click();
 $("cRefIn").onchange = async (e) => {
   const files = [...e.target.files]; e.target.value = "";
   try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (_) {}
-  let n = 0;
+  let n = 0; const failed = [];
   for (const f of files) {
     cMsg(`Saving references… ${++n}/${files.length}`);
-    try { const { b64 } = await shrinkImage(f, REF_EDGE); await refTx("readwrite", (st) => st.add({ name: f.name || "", b64 })); }
-    catch (err) { cMsg("Couldn't save a reference: " + err.message, "bad"); }
+    try { const rec = await readReference(f); await refTx("readwrite", (st) => st.add(rec)); }
+    catch (err) { failed.push((f.name || "a file") + ": " + err.message); }
   }
   await loadRefs();
-  cMsg(`${claudeRefs.length} references saved on this phone.`, "good");
+  if (failed.length) cMsg("Not added: " + failed.join("; "), "bad");
+  else cMsg(`${claudeRefs.length} references saved on this phone.`, "good");
 };
 $("cRefClear").onclick = async () => {
   if (!claudeRefs.length || !confirm(`Remove all ${claudeRefs.length} references from this phone?`)) return;
@@ -2109,7 +2258,10 @@ async function writeWithClaude() {
     const content = [];
     if (claudeRefs.length) {
       content.push({ type: "text", text: "References (Kontext):" });
-      claudeRefs.forEach((r) => content.push(img(r.b64)));
+      claudeRefs.forEach((r) => content.push(
+        r.kind === "pdf" ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: r.b64 }, title: r.name || "PDF" } :
+        r.kind === "text" ? { type: "document", source: { type: "text", media_type: "text/plain", data: r.text }, title: r.name || "Text" } :
+        img(r.b64)));
       content[content.length - 1].cache_control = { type: "ephemeral" };   // same every time: cached, ~1/20 of the price
     }
     content.push({ type: "text", text: `Today's date: ${todayText()}.\n` + (claudeTasks.length === 1 ? "Aufgabe:" : `Aufgabe (${claudeTasks.length} Bilder):`) });
